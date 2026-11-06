@@ -368,62 +368,157 @@ async def descender(interaction: discord.Interaction, usuario: discord.Member,
 
 
 # NOTICIAS ------------------------------------------------------------------------------------------------------------
+# /noticia abre el formulario "Crea tu Noticia" (igual al de MXRP): título, contenido, tipo de noticia e imágenes.
+# Según el tipo, la noticia se publica en su canal y se menciona al rol de ese tipo.
 
-@bot.tree.command(name="noticia", description="Publica una noticia de Grupo Televisa")
-@app_commands.describe(
-    titular="Titular de la noticia",
-    contenido="Texto de la noticia",
-    imagen="Imagen de la noticia (opcional)",
-    canal="Canal donde se publica (si lo dejas vacío, este mismo canal)",
-    ping="Rol al que se menciona (opcional)",
-)
+MAX_IMAGENES_NOTICIA = 6
+LINEA_NOTICIA = "\\_" * 15   # línea de guiones bajos antes de "Publicado por"
+IMAGENES_POR_GALERIA = 4   # Discord junta como máximo 4 imágenes en una misma galería de embeds
+
+TIPOS_NOTICIA = {
+    "seguridad": {
+        "nombre": "Seguridad", "panel": "Seguridad", "emoji": "🚨",
+        "rol": 1568366842353950820, "canal": 1568371179717263445,
+        "desc": "Operativos, detenciones y alertas de seguridad.",
+    },
+    "politica": {
+        "nombre": "Política o Financiera", "panel": "Política y Economía", "emoji": "⚖️",
+        "rol": 1568368357646794873, "canal": 1568371258217865246,
+        "desc": "Política, economía, finanzas y decisiones importantes.",
+    },
+    "generales": {
+        "nombre": "Generales", "panel": "Generales", "emoji": "🌐",
+        "rol": 1568366980820377670, "canal": 1568371204270596226,
+        "desc": "Todo lo demás: eventos, anuncios y noticias de la ciudad.",
+    },
+}
+
+
+def armar_embeds_noticia(embed: discord.Embed, files: list) -> list:
+    """Pone las imágenes ABAJO de la noticia. Cada 4 imágenes se juntan en una galería (límite de Discord)."""
+    embeds = [embed]
+    for g, inicio in enumerate(range(0, len(files), IMAGENES_POR_GALERIA)):
+        grupo = files[inicio:inicio + IMAGENES_POR_GALERIA]
+        url = f"https://discord.com/#noticia{g}"   # misma URL en la galería para que Discord junte las imágenes
+        for i, archivo in enumerate(grupo):
+            if g == 0 and i == 0:
+                destino = embed
+            else:
+                destino = discord.Embed(color=COLOR_TELEVISA)
+                embeds.append(destino)
+            if len(grupo) > 1:
+                destino.url = url
+            destino.set_image(url=f"attachment://{archivo.filename}")
+    return embeds
+
+
+class NoticiaModal(ModalBase, title="Crea tu Noticia"):
+
+    titulo = discord.ui.Label(
+        text="Título de la Noticia",
+        description="Especifica el título de la noticia",
+        component=discord.ui.TextInput(
+            placeholder="Ej: ¡Nuevo evento en la ciudad!",
+            max_length=150,
+        ),
+    )
+
+    contenido = discord.ui.Label(
+        text="Contenido de la Noticia",
+        description="Escribe el contenido detallado de la noticia",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="Escribe aquí el contenido de la noticia...",
+            max_length=3000,
+        ),
+    )
+
+    tipo = discord.ui.Label(
+        text="Tipo de noticia",
+        description="Elige el tipo de noticia que vas a publicar.",
+        component=discord.ui.Select(
+            placeholder="Elige un tipo",
+            options=[
+                discord.SelectOption(label=cfg["nombre"], value=clave, emoji=cfg["emoji"], description=cfg["desc"][:100])
+                for clave, cfg in TIPOS_NOTICIA.items()
+            ],
+        ),
+    )
+
+    imagenes = discord.ui.Label(
+        text="Imagen de la Noticia",
+        description=f"Sube una imagen relacionada con la noticia (Opcional, máximo {MAX_IMAGENES_NOTICIA})",
+        component=discord.ui.FileUpload(
+            min_values=0,
+            max_values=MAX_IMAGENES_NOTICIA,
+            required=False,
+        ),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        titulo = self.titulo.component.value.strip()
+        contenido = self.contenido.component.value.strip()
+        cfg = TIPOS_NOTICIA[self.tipo.component.values[0]]
+        archivos = list(self.imagenes.component.values or [])
+
+        if len(archivos) > MAX_IMAGENES_NOTICIA:
+            return await interaction.response.send_message(
+                f"Máximo {MAX_IMAGENES_NOTICIA} imágenes.", ephemeral=True)
+
+        for a in archivos:
+            if not es_imagen(a):
+                return await interaction.response.send_message("Los archivos deben ser imágenes o GIFs.", ephemeral=True)
+            if a.size > interaction.guild.filesize_limit:
+                return await interaction.response.send_message(
+                    "Una imagen pesa más de lo que permite este servidor para subir archivos.", ephemeral=True)
+
+        canal = await _canal_por_id(cfg["canal"])
+        if canal is None:
+            return await interaction.response.send_message(
+                f"No encontré el canal de noticias de {cfg['nombre']}.", ephemeral=True)
+
+        # Volver a subir las imágenes puede tardar más de 3 segundos
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        # La línea de guiones bajos y "Publicado por" van siempre al final, igual que en MXRP
+        embed = discord.Embed(
+            description=(
+                f"### {NOMBRE}\n"
+                f"## {titulo}\n"
+                f"{contenido}\n\n"
+                f"{LINEA_NOTICIA}\n"
+                f"***Publicado por:*** {interaction.user.mention}"
+            )[:4096],
+            color=COLOR_TELEVISA,
+        )
+        embed.set_thumbnail(url=guild.icon.url if guild.icon else interaction.user.display_avatar.url)
+
+        try:
+            files = [
+                await a.to_file(filename=f"noticia_{i}{extension_archivo(a)}")
+                for i, a in enumerate(archivos, start=1)
+            ]
+            mensaje = await canal.send(
+                content=f"<@&{cfg['rol']}>",
+                embeds=armar_embeds_noticia(embed, files),
+                files=files,
+                allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=cfg["rol"])], users=False),
+            )
+        except Exception as e:
+            print(f" Error publicando la noticia: {e!r}")
+            return await interaction.followup.send(
+                f"No pude publicar la noticia. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+        await interaction.followup.send(f"Noticia publicada en {canal.mention}: {mensaje.jump_url}", ephemeral=True)
+
+
+@bot.tree.command(name="noticia", description="Crea y publica una noticia de Grupo Televisa")
 @app_commands.checks.has_permissions(manage_roles=True)
 @app_commands.guild_only()
-async def noticia(
-    interaction: discord.Interaction,
-    titular: app_commands.Range[str, 1, 200],
-    contenido: app_commands.Range[str, 1, 1800],
-    imagen: Optional[discord.Attachment] = None,
-    canal: Optional[discord.TextChannel] = None,
-    ping: Optional[discord.Role] = None,
-):
-    destino = canal or interaction.channel
-
-    if imagen is not None:
-        if not es_imagen(imagen):
-            return await interaction.response.send_message("El archivo debe ser una imagen o GIF.", ephemeral=True)
-        if imagen.size > interaction.guild.filesize_limit:
-            return await interaction.response.send_message(
-                "El archivo pesa más de lo que permite este servidor para subir archivos.", ephemeral=True)
-
-    await interaction.response.defer(ephemeral=True)
-
-    embed = discord.Embed(
-        description=f"**🔴 ÚLTIMA HORA**\n# {titular}\n{contenido}",
-        color=COLOR_TELEVISA,
-        timestamp=datetime.now(timezone.utc),
-    )
-    embed.set_footer(text=f"{NOMBRE} · Noticias", icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
-
-    kwargs = {}
-    if imagen is not None:
-        nombre = f"noticia{extension_archivo(imagen)}"
-        kwargs["file"] = await imagen.to_file(filename=nombre)
-        embed.set_image(url=f"attachment://{nombre}")
-
-    try:
-        mensaje = await destino.send(
-            content=ping.mention if ping else None,
-            embed=embed,
-            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=ping.id)], users=False) if ping
-            else discord.AllowedMentions.none(),
-            **kwargs,
-        )
-    except Exception as e:
-        print(f" Error publicando la noticia: {e!r}")
-        return await interaction.followup.send(f"No pude publicar la noticia. Error: `{type(e).__name__}: {e}`", ephemeral=True)
-
-    await interaction.followup.send(f"Noticia publicada: {mensaje.jump_url}", ephemeral=True)
+async def noticia(interaction: discord.Interaction):
+    await interaction.response.send_modal(NoticiaModal())
 
 
 # GENERADOR DE EMBEDS (/embed) ----------------------------------------------------------------------------------------
@@ -2207,6 +2302,252 @@ async def reclutamiento_al_iniciar():
     _INICIO_RECLUTAMIENTO["hecho"] = True
     bot.add_view(PanelReclutamientoView())
     bot.add_view(SolicitudReclutamientoView())
+# PANEL DE NOTICIAS (roles por botón) ---------------------------------------------------------------------------------
+# /panel-noticias publica un panel donde cada quien se pone o se quita, con un click, el rol del tipo de noticia que
+# quiere recibir (esos roles son los que se mencionan cuando se publica una noticia).
+
+CANAL_PANEL_NOTICIAS_ID = 1568373659775541378
+
+
+def embed_panel_noticias(guild: discord.Guild, con_imagen: bool) -> discord.Embed:
+    bloques = []
+    for cfg in TIPOS_NOTICIA.values():
+        rol = guild.get_role(cfg["rol"])
+        suscritos = len(rol.members) if rol else 0
+        bloques.append(
+            f"{cfg['emoji']} **{cfg['panel']}**\n"
+            f"> {cfg['desc']}\n"
+            f"> <@&{cfg['rol']}> · 👥 **{suscritos}** suscritos"
+        )
+
+    embed = discord.Embed(
+        description=(
+            f"# 📰 NOTICIAS {NOMBRE.upper()}\n"
+            f"***Elige qué noticias quieres recibir.***\n\n"
+            + "\n\n".join(bloques)
+            + "\n\n-# Pulsa un botón para activar el aviso y vuelve a pulsarlo para quitarlo."
+        ),
+        color=COLOR_TELEVISA,
+    )
+    if con_imagen:
+        embed.set_image(url="attachment://fondo.png")
+    embed.set_footer(text=f"{NOMBRE} · Noticias", icon_url=guild.icon.url if guild.icon else None)
+    return embed
+
+
+async def alternar_rol_noticias(interaction: discord.Interaction, clave: str):
+    cfg = TIPOS_NOTICIA[clave]
+    guild = interaction.guild
+    miembro = interaction.user
+    rol = guild.get_role(cfg["rol"])
+
+    if rol is None:
+        return await interaction.response.send_message("No encontré ese rol en el servidor.", ephemeral=True)
+    if rol >= guild.me.top_role:
+        return await interaction.response.send_message(
+            "No puedo gestionar ese rol: está por encima o igual a mi rol más alto.", ephemeral=True)
+
+    try:
+        if rol in miembro.roles:
+            await miembro.remove_roles(rol, reason="Panel de noticias")
+            texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        else:
+            await miembro.add_roles(rol, reason="Panel de noticias")
+            texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+    except discord.Forbidden:
+        return await interaction.response.send_message(
+            "No pude cambiar tu rol. Avisa a un directivo.", ephemeral=True)
+
+    await interaction.response.send_message(texto, ephemeral=True)
+
+    # Actualiza el contador de suscritos del panel
+    try:
+        con_imagen = any(a.filename == "fondo.png" for a in interaction.message.attachments)
+        await interaction.message.edit(embed=embed_panel_noticias(guild, con_imagen), view=PanelNoticiasView())
+    except Exception as e:
+        print(f" No pude actualizar el contador del panel de noticias: {e!r}")
+
+
+class PanelNoticiasView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Seguridad", style=discord.ButtonStyle.danger, emoji="🚨", custom_id="noticias_seguridad")
+    async def seguridad(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await alternar_rol_noticias(interaction, "seguridad")
+
+    @discord.ui.button(label="Generales", style=discord.ButtonStyle.primary, emoji="🌐", custom_id="noticias_generales")
+    async def generales(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await alternar_rol_noticias(interaction, "generales")
+
+    @discord.ui.button(label="Política y Economía", style=discord.ButtonStyle.success, emoji="⚖️", custom_id="noticias_politica")
+    async def politica(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await alternar_rol_noticias(interaction, "politica")
+
+
+@bot.tree.command(name="panel-noticias", description="Publica el panel para elegir qué noticias recibir")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_noticias(interaction: discord.Interaction):
+    canal = await _canal_por_id(CANAL_PANEL_NOTICIAS_ID)
+    if canal is None:
+        return await interaction.response.send_message("No encontré el canal del panel de noticias.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    kwargs = {}
+    ruta = buscar_archivo("fondo.png")
+    if ruta:
+        kwargs["file"] = discord.File(ruta, filename="fondo.png")
+
+    try:
+        await canal.send(embed=embed_panel_noticias(interaction.guild, bool(ruta)), view=PanelNoticiasView(), **kwargs)
+    except Exception as e:
+        print(f" Error publicando el panel de noticias: {e!r}")
+        return await interaction.followup.send(f"No pude publicar el panel. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    await interaction.followup.send(f"Panel de noticias publicado en {canal.mention}.", ephemeral=True)
+
+
+_INICIO_NOTICIAS = {"hecho": False}
+
+
+@bot.listen("on_ready")
+async def noticias_al_iniciar():
+    """Recupera los botones del panel de noticias después de reiniciar el bot."""
+    if _INICIO_NOTICIAS["hecho"]:
+        return
+    _INICIO_NOTICIAS["hecho"] = True
+    bot.add_view(PanelNoticiasView())
+
+
+# DESPEDIR ------------------------------------------------------------------------------------------------------------
+# /despedir quita TODOS los roles y deja solo "ingreso" y "ciudadano". El aviso llega al canal de despidos.
+
+CANAL_DESPIDOS_ID = 1554335869593198622
+ROL_INGRESO_ID = 1554324885067538432
+ROL_CIUDADANO_ID = 1554362466564186142
+
+
+def error_jerarquia(guild: discord.Guild, usuario: discord.Member, roles_extra: list, autor=None) -> Optional[str]:
+    """Revisa la jerarquía de Discord. Devuelve un mensaje de error o None si se puede continuar."""
+    yo = guild.me
+
+    if usuario == guild.owner:
+        return "No puedo modificar al dueño del servidor."
+    if usuario.top_role >= yo.top_role:
+        return "No puedo modificar a este usuario: su rol más alto está por encima o igual al mío."
+    for rol in roles_extra:
+        if rol >= yo.top_role:
+            return f"No puedo asignar el rol {rol.name}: está por encima o igual a mi rol más alto."
+    if autor is not None and autor != guild.owner and usuario.top_role >= autor.top_role:
+        return "No puedes hacerlo con este usuario: su rol más alto está por encima o igual al tuyo."
+    return None
+
+
+async def reemplazar_roles(guild: discord.Guild, usuario: discord.Member, roles_nuevos: list, razon: str) -> list:
+    """Da los roles nuevos y quita TODOS los demás (menos @everyone y los gestionados por Discord).
+    Primero agrega y luego quita, así nunca se queda sin roles si algo falla."""
+    ids_nuevos = {r.id for r in roles_nuevos}
+    por_agregar = [r for r in roles_nuevos if r not in usuario.roles]
+    retirar = [
+        r for r in usuario.roles
+        if r != guild.default_role and not r.managed and r.id not in ids_nuevos
+    ]
+
+    if por_agregar:
+        await usuario.add_roles(*por_agregar, reason=razon)
+    if retirar:
+        await usuario.remove_roles(*retirar, reason=razon)
+
+    return retirar
+
+
+@bot.tree.command(name="despedir", description="Despide a un usuario: le quita todos los roles y deja Ingreso y Ciudadano")
+@app_commands.describe(
+    usuario="Usuario a despedir",
+    motivo="Motivo del despido",
+    imagen="Imagen de prueba (opcional)",
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.guild_only()
+async def despedir(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    motivo: app_commands.Range[str, 1, 500],
+    imagen: Optional[discord.Attachment] = None,
+):
+    guild = interaction.guild
+    autor = interaction.user
+
+    if usuario.bot:
+        return await interaction.response.send_message("No puedes despedir a un bot.", ephemeral=True)
+    if usuario == autor:
+        return await interaction.response.send_message("No puedes despedirte a ti mismo.", ephemeral=True)
+
+    rol_ingreso = guild.get_role(ROL_INGRESO_ID)
+    rol_ciudadano = guild.get_role(ROL_CIUDADANO_ID)
+    if rol_ingreso is None or rol_ciudadano is None:
+        return await interaction.response.send_message("No encontré el rol de Ingreso o el de Ciudadano.", ephemeral=True)
+
+    error = error_jerarquia(guild, usuario, [rol_ingreso, rol_ciudadano], autor)
+    if error:
+        return await interaction.response.send_message(error, ephemeral=True)
+
+    if imagen is not None:
+        if not es_imagen(imagen):
+            return await interaction.response.send_message("La prueba debe ser una imagen.", ephemeral=True)
+        if imagen.size > guild.filesize_limit:
+            return await interaction.response.send_message("La imagen pesa más de lo que permite este servidor.", ephemeral=True)
+
+    canal = await _canal_por_id(CANAL_DESPIDOS_ID)
+    if canal is None:
+        return await interaction.response.send_message("No encontré el canal de despidos.", ephemeral=True)
+
+    # Quitar roles puede tardar más de 3 segundos
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        retirados = await reemplazar_roles(guild, usuario, [rol_ingreso, rol_ciudadano], f"Despedido por {autor}: {motivo}")
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "No pude cambiar los roles. Revisa que el bot tenga **Gestionar roles** y esté por encima de ellos.", ephemeral=True)
+    except Exception as e:
+        print(f" Error despidiendo a {usuario}: {e!r}")
+        return await interaction.followup.send("No pude despedir al usuario. Revisa la consola del bot.", ephemeral=True)
+
+    embed = discord.Embed(
+        description=(
+            f"# DESPIDO\n\n"
+            f"**Usuario despedido:**\n{usuario.mention}\n\n"
+            f"**Motivo:**\n{motivo}\n\n"
+            f"**ID de usuario:**\n{usuario.id}"
+        ),
+        color=COLOR_TELEVISA,
+    )
+    embed.add_field(name="Fecha:", value=datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y"), inline=True)
+    # Foto pequeña arriba a la izquierda: la foto de perfil de quien despide
+    embed.set_author(name=f"Despide: {autor.display_name}", icon_url=autor.display_avatar.url)
+    embed.set_footer(text=NOMBRE, icon_url=guild.icon.url if guild.icon else None)
+
+    kwargs = {}
+    if imagen is not None:
+        nombre = f"despido{extension_archivo(imagen)}"
+        kwargs["file"] = await imagen.to_file(filename=nombre)
+        embed.set_image(url=f"attachment://{nombre}")
+
+    try:
+        await canal.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+    except Exception as e:
+        print(f" Error enviando el aviso de despido: {e!r}")
+        return await interaction.followup.send("El usuario fue despedido, pero no pude enviar el aviso.", ephemeral=True)
+
+    await interaction.followup.send(
+        f"{usuario.mention} fue despedido ({len(retirados)} rol(es) retirados).",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 # INICIAR BOT
 
 if not TOKEN:
