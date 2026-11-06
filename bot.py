@@ -1510,7 +1510,8 @@ class SesionReclutamiento:
 
     def __init__(self, miembro: discord.Member):
         self.user = miembro
-        self.respuestas = []
+        self.respuestas = {}
+        self.ocupada = False
         self.paso = 0
         self.iniciado = False
         self.inicio = datetime.now(timezone.utc)
@@ -1604,7 +1605,11 @@ class PreguntaSelectView(VistaSesion):
         ],
     )
     async def seleccion(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.sesion.respuestas.append(select.values[0])
+        self.sesion.respuestas[self.sesion.paso] = select.values[0]
+    if any(i not in r for i in range(len(PREGUNTAS))) or not hasattr(r[2], "to_file") or not hasattr(r[4], "to_file"):
+        print(f" Respuestas desordenadas: {[type(r.get(i)).__name__ for i in range(len(PREGUNTAS))]}")
+        await usuario.send(embed=embed_rec("Hubo un problema con tus respuestas. Vuelve a iniciar el formulario."))
+        return        
         await interaction.response.defer()
         self.stop()
         await avanzar_formulario(self.sesion)
@@ -1637,7 +1642,6 @@ async def avanzar_formulario(sesion: SesionReclutamiento):
     else:
         await enviar_pregunta(sesion)
 
-
 @bot.listen("on_message")
 async def respuestas_formulario(message: discord.Message):
     """Recibe las respuestas de texto e imagen que el usuario manda por DM."""
@@ -1647,7 +1651,8 @@ async def respuestas_formulario(message: discord.Message):
 
     sesion = SESIONES.get(message.author.id)
 
-    if sesion is None or not sesion.iniciado:
+    # Si todavía se está procesando una respuesta, se ignora este mensaje (evita respuestas duplicadas)
+    if sesion is None or not sesion.iniciado or sesion.ocupada:
         return
 
     pregunta = PREGUNTAS[sesion.paso]
@@ -1661,16 +1666,19 @@ async def respuestas_formulario(message: discord.Message):
             return await message.channel.send("Responde esta pregunta escribiendo un mensaje.")
         if len(texto) > 900:
             return await message.channel.send("Tu respuesta es muy larga (máximo 900 caracteres).")
-        sesion.respuestas.append(texto)
-
+        valor = texto
     else:
         imagenes = [a for a in message.attachments if es_imagen(a)]
         if not imagenes:
             return await message.channel.send("Debes adjuntar una imagen como respuesta a esta pregunta.")
-        sesion.respuestas.append(imagenes[0])
+        valor = imagenes[0]
 
-    await avanzar_formulario(sesion)
-
+    sesion.ocupada = True
+    try:
+        sesion.respuestas[sesion.paso] = valor
+        await avanzar_formulario(sesion)
+    finally:
+        sesion.ocupada = False
 
 async def finalizar_formulario(sesion: SesionReclutamiento):
     SESIONES.pop(sesion.user.id, None)
