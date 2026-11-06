@@ -1471,7 +1471,697 @@ async def crear_embed(
             "Selecciona un canal de texto o un foro.",
             ephemeral=True
         )
+import uuid
 
+# RECLUTAMIENTO CON FORMULARIO
+
+# CONFIGURACION DEL RECLUTAMIENTO -------------------------------------------------------------------------------------
+
+CANAL_RECLUTAMIENTO_ID = 1554330185736650802                 # Donde se publica el panel con el menú. 0 = el canal donde uses /panel-reclutamiento
+CANAL_SOLICITUDES_RECLUTAMIENTO_ID = 1568144369511440515     # OBLIGATORIO: aquí llegan las solicitudes (Aceptar / Rechazar)
+CANAL_LOGS_RECLUTAMIENTO_ID = 1568144615830196274             # Log de reclutamientos aceptados (opcional, 0 = no manda log)
+CANAL_IMAGENES_RECLUTAMIENTO_ID = 1554330185736650802        # Donde se guardan las fotos (INE / servidores). 0 = usa el canal de solicitudes
+ROL_PING_RECLUTAMIENTO_ID = 1568142087948345405              # Rol al que se le hace ping cuando llega una solicitud (0 = sin ping)
+ROL_ENLISTAMIENTO_ID = 1554362466564186142                   # Rol de "aspirante" que se le quita al aceptar (0 = no quita ninguno)
+ROLES_EXTRA_RECLUTAMIENTO_IDS = [1554367563440328734, 1554368070145937469]
+
+URL_REQUISITOS = ""                        # Link de requisitos (opcional). Vacío = no sale la línea en el panel
+URL_MXRP_COMANDOS = "https://discord.com/channels/1193021133981765632/1247772158722310214"
+
+# Relleno invisible para que el embed de la solicitud salga ancho (sube o baja el 60 si lo quieres más o menos ancho)
+RELLENO_ANCHO = "\u2800" * 60
+TIEMPO_FORMULARIO = 1800  # Segundos de inactividad antes de que expire el formulario (30 min)
+
+# Tipos: "texto" (el usuario escribe un mensaje), "imagen" (adjunta una imagen), "select" (menú Si / No)
+# OJO: finalizar_formulario() lee las respuestas por posición (r[0] ... r[6]), si cambias el orden cámbialo también allá.
+PREGUNTAS = [
+    {"tipo": "texto",  "texto": "¿Cómo llegaste a Grupo Televisa?, si fue invitado adjunta el nombre de la persona."},
+    {"tipo": "texto",  "texto": "¿Cuál es tu experiencia en MXRP u otros servidores de roleplay?"},
+    {"tipo": "imagen", "texto": "Coloca una foto de tu INE / PASAPORTE de MXRP (obligatorio, si no lo tienes tramítalo en MXRP)."},
+    {"tipo": "texto",  "texto": "Inserta tu Usuario de Roblox."},
+    {"tipo": "texto", "texto": "De el 1 al 10, ¿Qué tan buena redacción tiene?."},
+    {"tipo": "select", "texto": "Respetaré a mis compañeros y seguiré las órdenes de los directivos."},
+    {"tipo": "select", "texto": "Prometo tener compromiso y actividad constante en Grupo Televisa."},
+]
+
+
+class SesionReclutamiento:
+    """Estado del formulario de un usuario (se guarda en memoria mientras lo contesta)."""
+
+    def __init__(self, miembro: discord.Member):
+        self.user = miembro
+        self.respuestas = []
+        self.paso = 0
+        self.iniciado = False
+        self.inicio = datetime.now(timezone.utc)
+        self.mensaje: Optional[discord.Message] = None  # Último mensaje del formulario enviado por DM
+
+
+SESIONES: dict = {}
+
+
+def embed_rec(texto: str, pregunta: Optional[int] = None) -> discord.Embed:
+    descripcion = texto
+    if pregunta is not None:
+        descripcion += f"\n\n**Pregunta: {pregunta}/{len(PREGUNTAS)}.**"
+    embed = discord.Embed(title=f"Reclutamiento de {NOMBRE}.", description=descripcion, color=COLOR_TELEVISA)
+    embed.set_footer(text=NOMBRE, icon_url=bot.user.display_avatar.url if bot.user else None)
+    return embed
+
+
+async def quitar_botones(mensaje: Optional[discord.Message]):
+    if mensaje is None:
+        return
+    try:
+        await mensaje.edit(view=None)
+    except Exception:
+        pass
+
+
+async def cancelar_formulario(interaction: discord.Interaction, sesion: SesionReclutamiento):
+    SESIONES.pop(sesion.user.id, None)
+    await interaction.response.edit_message(
+        embed=embed_rec("Cancelaste el formulario. Si quieres volver a intentarlo, elige la opción de nuevo en el canal de reclutamiento."),
+        view=None
+    )
+
+
+class VistaSesion(discord.ui.View):
+    """Base de los mensajes del formulario: si el usuario no responde, la sesión expira."""
+
+    def __init__(self, sesion: SesionReclutamiento):
+        super().__init__(timeout=TIEMPO_FORMULARIO)
+        self.sesion = sesion
+
+    async def on_timeout(self):
+        s = self.sesion
+        mensaje = getattr(self, "message", None)
+        if SESIONES.get(s.user.id) is s and mensaje and s.mensaje and s.mensaje.id == mensaje.id:
+            SESIONES.pop(s.user.id, None)
+            try:
+                await mensaje.edit(
+                    embed=embed_rec("Tu formulario expiró por inactividad. Vuelve a elegir la opción en el canal de reclutamiento."),
+                    view=None
+                )
+            except Exception:
+                pass
+
+
+class IniciarView(VistaSesion):
+
+    @discord.ui.button(label="Iniciar Formulario", style=discord.ButtonStyle.success)
+    async def iniciar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.sesion.iniciado = True
+        self.sesion.paso = 0
+        self.sesion.inicio = datetime.now(timezone.utc)
+        await interaction.response.edit_message(view=None)
+        self.stop()
+        await enviar_pregunta(self.sesion)
+
+    @discord.ui.button(label="Cancelar Formulario", style=discord.ButtonStyle.danger)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cancelar_formulario(interaction, self.sesion)
+        self.stop()
+
+
+class PreguntaView(VistaSesion):
+    """Preguntas de texto o imagen: solo tienen el botón de cancelar."""
+
+    @discord.ui.button(label="Cancelar Formulario", style=discord.ButtonStyle.danger)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cancelar_formulario(interaction, self.sesion)
+        self.stop()
+
+
+class PreguntaSelectView(VistaSesion):
+    """Preguntas de Si / No: menú desplegable + botón de cancelar."""
+
+    @discord.ui.select(
+        placeholder="Seleccionar opción",
+        options=[
+            discord.SelectOption(label="Si", value="Si"),
+            discord.SelectOption(label="No", value="No"),
+        ],
+    )
+    async def seleccion(self, interaction: discord.Interaction, select: discord.ui.Select):
+        self.sesion.respuestas.append(select.values[0])
+        await interaction.response.defer()
+        self.stop()
+        await avanzar_formulario(self.sesion)
+
+    @discord.ui.button(label="Cancelar Formulario", style=discord.ButtonStyle.danger)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cancelar_formulario(interaction, self.sesion)
+        self.stop()
+
+
+async def enviar_pregunta(sesion: SesionReclutamiento):
+    pregunta = PREGUNTAS[sesion.paso]
+    embed = embed_rec(f"**{pregunta['texto']}**", sesion.paso + 1)
+
+    vista = PreguntaSelectView(sesion) if pregunta["tipo"] == "select" else PreguntaView(sesion)
+
+    try:
+        sesion.mensaje = await sesion.user.send(embed=embed, view=vista)
+    except Exception as e:
+        print(f" No pude enviar la pregunta del formulario a {sesion.user}: {e}")
+        SESIONES.pop(sesion.user.id, None)
+
+
+async def avanzar_formulario(sesion: SesionReclutamiento):
+    await quitar_botones(sesion.mensaje)
+    sesion.paso += 1
+
+    if sesion.paso >= len(PREGUNTAS):
+        await finalizar_formulario(sesion)
+    else:
+        await enviar_pregunta(sesion)
+
+
+@bot.listen("on_message")
+async def respuestas_formulario(message: discord.Message):
+    """Recibe las respuestas de texto e imagen que el usuario manda por DM."""
+
+    if message.author.bot or message.guild is not None:
+        return
+
+    sesion = SESIONES.get(message.author.id)
+
+    if sesion is None or not sesion.iniciado:
+        return
+
+    pregunta = PREGUNTAS[sesion.paso]
+
+    if pregunta["tipo"] == "select":
+        return await message.channel.send("Para esta pregunta usa el menú desplegable de arriba.")
+
+    if pregunta["tipo"] == "texto":
+        texto = message.content.strip()
+        if not texto:
+            return await message.channel.send("Responde esta pregunta escribiendo un mensaje.")
+        if len(texto) > 900:
+            return await message.channel.send("Tu respuesta es muy larga (máximo 900 caracteres).")
+        sesion.respuestas.append(texto)
+
+    else:
+        imagenes = [a for a in message.attachments if es_imagen(a)]
+        if not imagenes:
+            return await message.channel.send("Debes adjuntar una imagen como respuesta a esta pregunta.")
+        sesion.respuestas.append(imagenes[0])
+
+    await avanzar_formulario(sesion)
+
+
+async def finalizar_formulario(sesion: SesionReclutamiento):
+    SESIONES.pop(sesion.user.id, None)
+
+    usuario = sesion.user
+    canal = bot.get_channel(CANAL_SOLICITUDES_RECLUTAMIENTO_ID) if CANAL_SOLICITUDES_RECLUTAMIENTO_ID else None
+
+    if not canal:
+        print(" No encontré el canal de solicitudes de reclutamiento (revisa CANAL_SOLICITUDES_RECLUTAMIENTO_ID).")
+        await usuario.send(embed=embed_rec("No pude enviar tu solicitud. Avisa a un directivo."))
+        return
+
+    duracion = int((datetime.now(timezone.utc) - sesion.inicio).total_seconds())
+    ahora = int(datetime.now(timezone.utc).timestamp())
+    fecha = datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y")
+    r = sesion.respuestas
+
+    # Orden de las respuestas (7 preguntas):
+    # r[0] cómo llegó | r[1] experiencia | r[2] foto INE | r[3] usuario de Roblox
+    # r[4] foto de sus servidores de discord | r[5] respeto | r[6] compromiso
+
+    unido = getattr(sesion.user, "joined_at", None)
+    unido_txt = f"<t:{int(unido.timestamp())}:R>" if unido else "Desconocido"
+    creada_txt = f"<t:{int(usuario.created_at.timestamp())}:R>"
+
+    try:
+        # Las fotos se suben a un canal y se guardan sus links para ponerlos como hipervínculo en la solicitud
+        canal_imagenes = (bot.get_channel(CANAL_IMAGENES_RECLUTAMIENTO_ID) if CANAL_IMAGENES_RECLUTAMIENTO_ID else None) or canal
+
+        ine = await r[2].to_file(filename=f"ine_{usuario.id}{extension_archivo(r[2])}")
+        servidores = await r[4].to_file(filename=f"servidores_{usuario.id}{extension_archivo(r[4])}")
+
+        msg_imagenes = await canal_imagenes.send(
+            content=f"Pruebas de la solicitud de {usuario.name} (`{usuario.id}`)",
+            files=[ine, servidores],
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        link_ine = msg_imagenes.attachments[0].url
+        link_servidores = msg_imagenes.attachments[1].url
+
+        # "###" da un texto más grande que la negrita pero más pequeño que el título "#"
+        embed = discord.Embed(
+            description=(
+                f"# SOLICITUD DE RECLUTAMIENTO\n"
+                f"**Solicitante:** {usuario.mention}\n"
+                f"### 1. ¿Cómo llegaste a {NOMBRE}?\n{r[0]}\n"
+                f"### 2. Experiencia en MXRP / roleplay.\n{r[1]}\n"
+                f"### 3. Foto de tu INE / PASAPORTE de MXRP.\n[Imagen adjunta (1)]({link_ine})\n"
+                f"### 4. Usuario de Roblox.\n{r[3]}\n"
+                f"### 5. Foto de todos tus servidores de discord.\n[Imagen adjunta (2)]({link_servidores})\n"
+                f"### 6. Respetaré a mis compañeros y seguiré las órdenes de los directivos.\n{r[5]}\n"
+                f"### 7. Prometo tener compromiso y actividad constante.\n{r[6]}\n"
+                f"**Estadísticas de la solicitud**\n"
+                f"ID de usuario: `{usuario.id}`\n"
+                f"Nombre de usuario: `{usuario.name}`\n"
+                f"Usuario: {usuario.mention}\n"
+                f"Duración: `{duracion}s`\n"
+                f"Cuenta creada: {creada_txt}\n"
+                f"Se unió al servidor: {unido_txt}\n"
+                f"Enviada: <t:{ahora}:R>\n"
+                f"ID de solicitud: `{uuid.uuid4().hex[:20]}`\n"
+                f"{RELLENO_ANCHO}"
+            )[:4096],
+            color=COLOR_TELEVISA,
+        )
+
+        # El campo Estado debe ser el primero (los botones lo editan)
+        embed.add_field(name="Estado:", value="Pendiente", inline=True)
+        embed.add_field(name="Fecha:", value=fecha, inline=True)
+        embed.set_thumbnail(url=usuario.display_avatar.url)
+        # El ID del solicitante va en el pie (no lo puede alterar el usuario con sus respuestas)
+        embed.set_footer(text=f"{NOMBRE} • Solicitud {usuario.id}",
+                         icon_url=canal.guild.icon.url if canal.guild.icon else None)
+
+        # El ping al rol va fuera del embed (en el content); al solicitante no se le hace ping
+        if ROL_PING_RECLUTAMIENTO_ID:
+            permitidos = discord.AllowedMentions(roles=[discord.Object(id=ROL_PING_RECLUTAMIENTO_ID)], users=False)
+            contenido = f"<@&{ROL_PING_RECLUTAMIENTO_ID}>"
+        else:
+            permitidos = discord.AllowedMentions.none()
+            contenido = None
+
+        await canal.send(
+            content=contenido,
+            embed=embed,
+            view=SolicitudReclutamientoView(),
+            allowed_mentions=permitidos,
+        )
+
+    except Exception as e:
+        print(f" Error enviando la solicitud de reclutamiento: {e!r}")
+        try:
+            await usuario.send(embed=embed_rec("No pude enviar tu solicitud. Avisa a un directivo."))
+        except Exception:
+            pass
+        return
+
+    try:
+        await usuario.send(embed=embed_rec(
+            "**Formulario enviado.**\nTu solicitud fue enviada correctamente. "
+            "Un directivo la revisará y te avisaremos por este chat."
+        ))
+    except Exception:
+        pass
+
+
+# ---------- Panel con el menú "Televisa | Formulario" ----------
+
+class PanelReclutamientoView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.select(
+        custom_id="panel_reclutamiento",
+        placeholder="Haz una selección",
+        options=[
+            discord.SelectOption(label="Televisa | Formulario", value="televisa_formulario"),
+        ],
+    )
+    async def seleccion(self, interaction: discord.Interaction, select: discord.ui.Select):
+
+        await interaction.response.defer(ephemeral=True)
+
+        # Reinicia el menú para que no se quede la opción marcada
+        try:
+            await interaction.message.edit(view=PanelReclutamientoView())
+        except Exception:
+            pass
+
+        usuario = interaction.user
+
+        if isinstance(usuario, discord.Member) and obtener_rango_actual(usuario) >= 0:
+            return await interaction.followup.send(f"Ya eres miembro de {NOMBRE}.", ephemeral=True)
+
+        if usuario.id in SESIONES:
+            return await interaction.followup.send(
+                "Ya tienes un formulario en curso. Revisa tus mensajes privados.", ephemeral=True
+            )
+
+        sesion = SesionReclutamiento(usuario)
+        SESIONES[usuario.id] = sesion
+
+        embed = embed_rec(f"Vas a iniciar el formulario para pertenecer a {NOMBRE}.")
+
+        try:
+            sesion.mensaje = await usuario.send(embed=embed, view=IniciarView(sesion))
+        except discord.Forbidden:
+            SESIONES.pop(usuario.id, None)
+            return await interaction.followup.send(
+                "No puedo enviarte mensajes privados. Activa tus **mensajes directos** en la configuración de privacidad "
+                "del servidor y vuelve a intentarlo.",
+                ephemeral=True
+            )
+        except Exception as e:
+            SESIONES.pop(usuario.id, None)
+            print(f" Error enviando el formulario por DM a {usuario}: {e}")
+            return await interaction.followup.send("No pude enviarte el formulario. Intenta de nuevo.", ephemeral=True)
+
+        await interaction.followup.send("Te envié el formulario por mensaje privado.", ephemeral=True)
+
+
+@bot.tree.command(name="panel-reclutamiento", description="Publica el panel de reclutamiento con el formulario")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_reclutamiento(interaction: discord.Interaction):
+
+    canal = bot.get_channel(CANAL_RECLUTAMIENTO_ID) if CANAL_RECLUTAMIENTO_ID else interaction.channel
+
+    if not canal:
+        return await interaction.response.send_message("No encontré el canal de reclutamiento.", ephemeral=True)
+
+    ruta_fondo = buscar_archivo("fondo.png")
+
+    if ruta_fondo is None:
+        return await interaction.response.send_message(
+            "Falta **fondo.png** junto a bot.py. Súbelo en la misma carpeta.", ephemeral=True
+        )
+
+    lineas = [
+        f"# Reclutamiento de {NOMBRE}.",
+        f"***Completa el siguiente formulario para convertirte en trabajador de {NOMBRE}.***",
+        "",
+    ]
+    if URL_REQUISITOS:
+        lineas.append(f"> **Revisa los requisitos en {URL_REQUISITOS} antes de iniciar tu reclutamiento.**\n")
+    lineas.append("> **Tu INE / PASAPORTE es obligatorio, si no lo tienes tramítalo en MXRP**.\n")
+    lineas.append(f"> **En {URL_MXRP_COMANDOS} utiliza /tramitar ine o pasaporte.**")
+
+    embed = discord.Embed(description="\n".join(lineas), color=COLOR_TELEVISA)
+    embed.set_image(url="attachment://fondo.png")
+    embed.set_footer(text=NOMBRE, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+
+    try:
+        await canal.send(
+            embed=embed,
+            view=PanelReclutamientoView(),
+            file=discord.File(ruta_fondo, filename="fondo.png"),
+        )
+    except Exception as e:
+        print(f" Error publicando el panel de reclutamiento: {e!r}")
+        return await interaction.response.send_message(
+            f"No pude publicar el panel. Error: `{type(e).__name__}: {e}`", ephemeral=True
+        )
+
+    await interaction.response.send_message("Panel de reclutamiento publicado correctamente.", ephemeral=True)
+
+
+# ---------- Solicitud en el canal de solicitudes: Aceptar / Rechazar ----------
+
+def id_solicitante_reclutamiento(embed: discord.Embed) -> Optional[int]:
+    """Lee el ID del solicitante desde el pie del embed (así los botones sirven aunque el bot se reinicie)."""
+    texto = embed.footer.text if embed.footer and embed.footer.text else ""
+    coincidencia = re.search(r"Solicitud (\d+)", texto)
+    return int(coincidencia.group(1)) if coincidencia else None
+
+
+async def avisar_por_dm(usuario_id: int, embed: discord.Embed) -> bool:
+    try:
+        usuario = await bot.fetch_user(usuario_id)
+        await usuario.send(embed=embed)
+        return True
+    except Exception as e:
+        print(f" No pude enviar el DM a {usuario_id}: {e}")
+        return False
+
+
+async def mensaje_actualizado(interaction: discord.Interaction, mensaje: discord.Message) -> discord.Message:
+    """Vuelve a leer el mensaje para saber si otro directivo ya resolvió la solicitud."""
+    try:
+        return await interaction.channel.fetch_message(mensaje.id)
+    except Exception:
+        return mensaje
+
+
+def ya_resuelta(mensaje: discord.Message) -> bool:
+    embed = mensaje.embeds[0] if mensaje.embeds else None
+    return bool(embed and embed.fields and embed.fields[0].value != "Pendiente")
+
+
+async def dar_roles_reclutamiento(guild: discord.Guild, usuario: discord.Member, responsable):
+    """Da los roles iniciales y quita el rol de aspirante. Devuelve (roles, retirados, None) o (None, [], error)."""
+
+    ids_roles = [SEPARADORES_RANGO[0], JERARQUIA[0]] + list(ROLES_EXTRA_RECLUTAMIENTO_IDS)
+    roles = [guild.get_role(rol_id) for rol_id in ids_roles]
+
+    if any(rol is None for rol in roles):
+        faltantes = [str(rol_id) for rol_id, rol in zip(ids_roles, roles) if rol is None]
+        return None, [], "No encontré estos roles en el servidor: " + ", ".join(faltantes)
+
+    muy_altos = [rol.name for rol in roles if rol >= guild.me.top_role]
+    if muy_altos:
+        return None, [], (
+            "No puedo asignar estos roles porque están por encima o igual a mi rol más alto: " + ", ".join(muy_altos)
+        )
+
+    try:
+        await usuario.add_roles(*roles, reason=f"Reclutado por {responsable}")
+    except discord.Forbidden:
+        return None, [], "No pude asignar los roles. Revisa que el bot tenga el permiso **Gestionar roles**."
+    except Exception as e:
+        print(f" Error reclutando a {usuario}: {e}")
+        return None, [], "No pude reclutar al usuario. Revisa la consola del bot."
+
+    retirados = []
+    rol_enlistamiento = guild.get_role(ROL_ENLISTAMIENTO_ID) if ROL_ENLISTAMIENTO_ID else None
+    if rol_enlistamiento is not None and rol_enlistamiento in usuario.roles:
+        try:
+            await usuario.remove_roles(rol_enlistamiento, reason=f"Reclutado por {responsable}")
+            retirados.append(rol_enlistamiento)
+        except Exception as e:
+            print(f" No pude quitar el rol de aspirante a {usuario}: {e}")
+
+    return roles, retirados, None
+
+
+async def enviar_log_reclutamiento(usuario: discord.Member, responsable, roles: list, retirados: list):
+    if not CANAL_LOGS_RECLUTAMIENTO_ID:
+        return
+    canal_log = bot.get_channel(CANAL_LOGS_RECLUTAMIENTO_ID)
+    if not canal_log:
+        print(" No encontré el canal de logs de reclutamiento.")
+        return
+
+    lista_roles = "\n".join(f"- {rol.name}" for rol in roles)
+    retirados_txt = ""
+    if retirados:
+        retirados_txt = "**Roles retirados:**\n" + "\n".join(f"- {r.name}" for r in retirados) + "\n\n"
+
+    embed_log = discord.Embed(
+        description=(
+            f"# RECLUTAMIENTO\n\n"
+            f"{usuario.mention} ya fue **reclutado**.\n\n"
+            f"**Responsable:**\n{responsable.mention}\n\n"
+            f"**Roles otorgados:**\n{lista_roles}\n\n"
+            f"{retirados_txt}"
+            f"**ID de usuario:**\n{usuario.id}\n\n"
+            f"**Nombre de Discord:**\n{usuario.name}\n\n"
+            f"**Fecha:**\n{datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y')}"
+        ),
+        color=COLOR_TELEVISA,
+    )
+    embed_log.set_footer(text=NOMBRE, icon_url=usuario.guild.icon.url if usuario.guild.icon else None)
+    try:
+        await canal_log.send(embed=embed_log, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f" Error enviando log de reclutamiento: {e}")
+
+
+class AceptarReclutaModal(ModalBase, title="Aceptar solicitud"):
+
+    motivo = discord.ui.Label(
+        text="Motivo (opcional)",
+        description="Si lo escribes, el usuario lo recibirá por mensaje privado.",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="Mensaje de bienvenida, observaciones...",
+            max_length=500,
+            required=False,
+        ),
+    )
+
+    def __init__(self, mensaje: discord.Message, solicitante_id: int):
+        super().__init__()
+        self.mensaje = mensaje
+        self.solicitante_id = solicitante_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        motivo = (self.motivo.component.value or "").strip()
+        guild = interaction.guild
+
+        await interaction.response.defer(ephemeral=True)
+
+        mensaje = await mensaje_actualizado(interaction, self.mensaje)
+
+        if ya_resuelta(mensaje):
+            return await interaction.followup.send("Esta solicitud ya fue resuelta.", ephemeral=True)
+
+        try:
+            miembro = guild.get_member(self.solicitante_id) or await guild.fetch_member(self.solicitante_id)
+        except discord.NotFound:
+            return await interaction.followup.send(
+                "El usuario ya no está en el servidor. Puedes rechazar la solicitud.", ephemeral=True
+            )
+
+        roles, retirados, error = await dar_roles_reclutamiento(guild, miembro, interaction.user)
+
+        if error:
+            return await interaction.followup.send(error, ephemeral=True)
+
+        await enviar_log_reclutamiento(miembro, interaction.user, roles, retirados)
+
+        # Actualiza la solicitud: estado Aceptado y se quitan los botones
+        try:
+            embeds = [e.copy() for e in mensaje.embeds]
+            extra = f"\n\n**Aceptado por:** {interaction.user.mention}"
+            if motivo:
+                extra += f"\n**Motivo:** {motivo}"
+            embeds[0].description = ((embeds[0].description or "") + extra)[:4096]
+            embeds[0].color = discord.Color.from_rgb(120, 177, 89)
+            embeds[0].set_field_at(0, name="Estado:", value="Aceptado", inline=True)
+            await mensaje.edit(embeds=embeds, view=None)
+        except Exception as e:
+            print(f" Error actualizando la solicitud de reclutamiento: {e}")
+
+        # DM al solicitante
+        texto_dm = f"**¡Felicidades!** Tu solicitud de reclutamiento a {NOMBRE} fue **aceptada**."
+        if motivo:
+            texto_dm += f"\n\n**Motivo:**\n{motivo}"
+        dm_ok = await avisar_por_dm(self.solicitante_id, embed_rec(texto_dm))
+
+        if dm_ok:
+            await interaction.followup.send("Solicitud aceptada: roles otorgados y usuario avisado por DM.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "Solicitud aceptada y roles otorgados, pero no pude enviar el DM (tiene los mensajes privados cerrados).",
+                ephemeral=True
+            )
+
+
+class RechazarReclutaModal(ModalBase, title="Rechazar solicitud"):
+
+    motivo = discord.ui.Label(
+        text="Motivo (opcional)",
+        description="Si lo escribes, el usuario lo recibirá por mensaje privado.",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="Explica por qué se rechaza la solicitud...",
+            max_length=500,
+            required=False,
+        ),
+    )
+
+    def __init__(self, mensaje: discord.Message, solicitante_id: int):
+        super().__init__()
+        self.mensaje = mensaje
+        self.solicitante_id = solicitante_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+
+        motivo = (self.motivo.component.value or "").strip()
+
+        await interaction.response.defer(ephemeral=True)
+
+        mensaje = await mensaje_actualizado(interaction, self.mensaje)
+
+        if ya_resuelta(mensaje):
+            return await interaction.followup.send("Esta solicitud ya fue resuelta.", ephemeral=True)
+
+        # Actualiza la solicitud: estado Rechazado y se quitan los botones
+        try:
+            embeds = [e.copy() for e in mensaje.embeds]
+            extra = f"\n\n**Rechazado por:** {interaction.user.mention}"
+            if motivo:
+                extra += f"\n**Motivo:** {motivo}"
+            embeds[0].description = ((embeds[0].description or "") + extra)[:4096]
+            embeds[0].color = discord.Color.from_rgb(221, 46, 68)
+            embeds[0].set_field_at(0, name="Estado:", value="Rechazado", inline=True)
+            await mensaje.edit(embeds=embeds, view=None)
+        except Exception as e:
+            print(f" Error actualizando la solicitud de reclutamiento: {e}")
+
+        # DM al solicitante (sin decir quién la rechazó)
+        texto_dm = "Tu solicitud de reclutamiento fue **rechazada**."
+        if motivo:
+            texto_dm += f"\n\n**Motivo:**\n{motivo}"
+        dm_ok = await avisar_por_dm(self.solicitante_id, embed_rec(texto_dm))
+
+        if dm_ok:
+            await interaction.followup.send("Solicitud rechazada y usuario avisado por DM.", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                "Solicitud rechazada, pero no pude enviar el DM (tiene los mensajes privados cerrados).",
+                ephemeral=True
+            )
+
+
+class SolicitudReclutamientoView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _validar(self, interaction: discord.Interaction) -> Optional[int]:
+        """Revisa permiso y estado. Devuelve el ID del solicitante o None si ya respondió con un error."""
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message("No tienes permiso para usar estos botones.", ephemeral=True)
+            return None
+
+        if not interaction.message.embeds:
+            await interaction.response.send_message("No pude leer los datos de esta solicitud.", ephemeral=True)
+            return None
+
+        solicitante_id = id_solicitante_reclutamiento(interaction.message.embeds[0])
+
+        if solicitante_id is None:
+            await interaction.response.send_message("No pude leer los datos de esta solicitud.", ephemeral=True)
+            return None
+
+        if ya_resuelta(interaction.message):
+            await interaction.response.send_message("Esta solicitud ya fue resuelta.", ephemeral=True)
+            return None
+
+        return solicitante_id
+
+    @discord.ui.button(label="Aceptar", style=discord.ButtonStyle.success, custom_id="reclutamiento_aceptar")
+    async def aceptar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        solicitante_id = await self._validar(interaction)
+        if solicitante_id is None:
+            return
+        await interaction.response.send_modal(AceptarReclutaModal(interaction.message, solicitante_id))
+
+    @discord.ui.button(label="Rechazar", style=discord.ButtonStyle.danger, custom_id="reclutamiento_rechazar")
+    async def rechazar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        solicitante_id = await self._validar(interaction)
+        if solicitante_id is None:
+            return
+        await interaction.response.send_modal(RechazarReclutaModal(interaction.message, solicitante_id))
+
+
+_INICIO_RECLUTAMIENTO = {"hecho": False}
+
+
+@bot.listen("on_ready")
+async def reclutamiento_al_iniciar():
+    """Recupera los botones del panel y de las solicitudes después de reiniciar el bot."""
+    if _INICIO_RECLUTAMIENTO["hecho"]:
+        return
+    _INICIO_RECLUTAMIENTO["hecho"] = True
+    bot.add_view(PanelReclutamientoView())
+    bot.add_view(SolicitudReclutamientoView())
 
 # INICIAR BOT
 
