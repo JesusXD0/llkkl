@@ -1473,31 +1473,29 @@ async def crear_embed(
 import uuid
 
 # RECLUTAMIENTO CON FORMULARIO
-
 # CONFIGURACION DEL RECLUTAMIENTO -------------------------------------------------------------------------------------
 
-CANAL_RECLUTAMIENTO_ID = 1554330185736650802                 # Donde se publica el panel con el menú. 0 = el canal donde uses /panel-reclutamiento
-CANAL_SOLICITUDES_RECLUTAMIENTO_ID = 1568144369511440515     # OBLIGATORIO: aquí llegan las solicitudes (Aceptar / Rechazar)
-CANAL_LOGS_RECLUTAMIENTO_ID = 1568144615830196274             # Log de reclutamientos aceptados (opcional, 0 = no manda log)
-CANAL_IMAGENES_RECLUTAMIENTO_ID = 1554330185736650802        # Donde se guardan las fotos (INE / servidores). 0 = usa el canal de solicitudes
-ROL_PING_RECLUTAMIENTO_ID = 1568142087948345405              # Rol al que se le hace ping cuando llega una solicitud (0 = sin ping)
-ROL_ENLISTAMIENTO_ID = 1554362466564186142                   # Rol de "aspirante" que se le quita al aceptar (0 = no quita ninguno)
+CANAL_RECLUTAMIENTO_ID = 1554330185736650802
+CANAL_SOLICITUDES_RECLUTAMIENTO_ID = 1568144369511440515
+CANAL_LOGS_RECLUTAMIENTO_ID = 1568144615830196274
+CANAL_IMAGENES_RECLUTAMIENTO_ID = 1554330185736650802
+ROL_PING_RECLUTAMIENTO_ID = 1568142087948345405
+ROL_ENLISTAMIENTO_ID = 1554362466564186142
 ROLES_EXTRA_RECLUTAMIENTO_IDS = [1554367563440328734, 1554368070145937469]
 
-URL_REQUISITOS = ""                        # Link de requisitos (opcional). Vacío = no sale la línea en el panel
+URL_REQUISITOS = ""
 URL_MXRP_COMANDOS = "https://discord.com/channels/1193021133981765632/1247772158722310214"
 
-# Relleno invisible para que el embed de la solicitud salga ancho (sube o baja el 60 si lo quieres más o menos ancho)
+# Relleno invisible para que el embed de la solicitud salga ancho
 RELLENO_ANCHO = "\u2800" * 60
-TIEMPO_FORMULARIO = 1800  # Segundos de inactividad antes de que expire el formulario (30 min)
+TIEMPO_FORMULARIO = 1800
 
-# Tipos: "texto" (el usuario escribe un mensaje), "imagen" (adjunta una imagen), "select" (menú Si / No)
-# OJO: finalizar_formulario() lee las respuestas por posición (r[0] ... r[6]), si cambias el orden cámbialo también allá.
+# Tipos: "texto", "imagen", "select"
 PREGUNTAS = [
-    {"tipo": "texto",  "texto": "¿Cómo llegaste a Grupo Televisa?, si fue invitado adjunta el nombre de la persona."},
-    {"tipo": "texto",  "texto": "¿Cuál es tu experiencia en MXRP u otros servidores de roleplay?"},
+    {"tipo": "texto", "texto": "¿Cómo llegaste a Grupo Televisa?, si fue invitado adjunta el nombre de la persona."},
+    {"tipo": "texto", "texto": "¿Cuál es tu experiencia en MXRP u otros servidores de roleplay?"},
     {"tipo": "imagen", "texto": "Coloca una foto de tu INE / PASAPORTE de MXRP (obligatorio, si no lo tienes tramítalo en MXRP)."},
-    {"tipo": "texto",  "texto": "Inserta tu Usuario de Roblox."},
+    {"tipo": "texto", "texto": "Inserta tu Usuario de Roblox."},
     {"tipo": "texto", "texto": "De el 1 al 10, ¿Qué tan buena redacción tiene?."},
     {"tipo": "select", "texto": "Respetaré a mis compañeros y seguiré las órdenes de los directivos."},
     {"tipo": "select", "texto": "Prometo tener compromiso y actividad constante en Grupo Televisa."},
@@ -1514,7 +1512,7 @@ class SesionReclutamiento:
         self.paso = 0
         self.iniciado = False
         self.inicio = datetime.now(timezone.utc)
-        self.mensaje: Optional[discord.Message] = None  # Último mensaje del formulario enviado por DM
+        self.mensaje: Optional[discord.Message] = None
 
 
 SESIONES: dict = {}
@@ -1524,8 +1522,16 @@ def embed_rec(texto: str, pregunta: Optional[int] = None) -> discord.Embed:
     descripcion = texto
     if pregunta is not None:
         descripcion += f"\n\n**Pregunta: {pregunta}/{len(PREGUNTAS)}.**"
-    embed = discord.Embed(title=f"Reclutamiento de {NOMBRE}.", description=descripcion, color=COLOR_TELEVISA)
-    embed.set_footer(text=NOMBRE, icon_url=bot.user.display_avatar.url if bot.user else None)
+
+    embed = discord.Embed(
+        title=f"Reclutamiento de {NOMBRE}.",
+        description=descripcion,
+        color=COLOR_TELEVISA
+    )
+    embed.set_footer(
+        text=NOMBRE,
+        icon_url=bot.user.display_avatar.url if bot.user else None
+    )
     return embed
 
 
@@ -1541,7 +1547,9 @@ async def quitar_botones(mensaje: Optional[discord.Message]):
 async def cancelar_formulario(interaction: discord.Interaction, sesion: SesionReclutamiento):
     SESIONES.pop(sesion.user.id, None)
     await interaction.response.edit_message(
-        embed=embed_rec("Cancelaste el formulario. Si quieres volver a intentarlo, elige la opción de nuevo en el canal de reclutamiento."),
+        embed=embed_rec(
+            "Cancelaste el formulario. Si quieres volver a intentarlo, elige la opción de nuevo en el canal de reclutamiento."
+        ),
         view=None
     )
 
@@ -1556,11 +1564,14 @@ class VistaSesion(discord.ui.View):
     async def on_timeout(self):
         s = self.sesion
         mensaje = getattr(self, "message", None)
+
         if SESIONES.get(s.user.id) is s and mensaje and s.mensaje and s.mensaje.id == mensaje.id:
             SESIONES.pop(s.user.id, None)
             try:
                 await mensaje.edit(
-                    embed=embed_rec("Tu formulario expiró por inactividad. Vuelve a elegir la opción en el canal de reclutamiento."),
+                    embed=embed_rec(
+                        "Tu formulario expiró por inactividad. Vuelve a elegir la opción en el canal de reclutamiento."
+                    ),
                     view=None
                 )
             except Exception:
@@ -1574,6 +1585,7 @@ class IniciarView(VistaSesion):
         self.sesion.iniciado = True
         self.sesion.paso = 0
         self.sesion.inicio = datetime.now(timezone.utc)
+
         await interaction.response.edit_message(view=None)
         self.stop()
         await enviar_pregunta(self.sesion)
@@ -1604,12 +1616,8 @@ class PreguntaSelectView(VistaSesion):
         ],
     )
     async def seleccion(self, interaction: discord.Interaction, select: discord.ui.Select):
-        self.sesion.respuestas[self.sesion.paso] = select.values[0]
-    if any(i not in r for i in range(len(PREGUNTAS))) or not hasattr(r[2], "to_file") or not hasattr(r[4], "to_file"):
-        print(f" Respuestas desordenadas: {[type(r.get(i)).__name__ for i in range(len(PREGUNTAS))]}")
-        await usuario.send(embed=embed_rec("Hubo un problema con tus respuestas. Vuelve a iniciar el formulario."))
-        return        
         await interaction.response.defer()
+        self.sesion.respuestas[self.sesion.paso] = select.values[0]
         self.stop()
         await avanzar_formulario(self.sesion)
 
@@ -1641,6 +1649,7 @@ async def avanzar_formulario(sesion: SesionReclutamiento):
     else:
         await enviar_pregunta(sesion)
 
+
 @bot.listen("on_message")
 async def respuestas_formulario(message: discord.Message):
     """Recibe las respuestas de texto e imagen que el usuario manda por DM."""
@@ -1650,7 +1659,6 @@ async def respuestas_formulario(message: discord.Message):
 
     sesion = SESIONES.get(message.author.id)
 
-    # Si todavía se está procesando una respuesta, se ignora este mensaje (evita respuestas duplicadas)
     if sesion is None or not sesion.iniciado or sesion.ocupada:
         return
 
@@ -1661,23 +1669,31 @@ async def respuestas_formulario(message: discord.Message):
 
     if pregunta["tipo"] == "texto":
         texto = message.content.strip()
+
         if not texto:
             return await message.channel.send("Responde esta pregunta escribiendo un mensaje.")
+
         if len(texto) > 900:
             return await message.channel.send("Tu respuesta es muy larga (máximo 900 caracteres).")
+
         valor = texto
+
     else:
         imagenes = [a for a in message.attachments if es_imagen(a)]
+
         if not imagenes:
             return await message.channel.send("Debes adjuntar una imagen como respuesta a esta pregunta.")
+
         valor = imagenes[0]
 
     sesion.ocupada = True
+
     try:
         sesion.respuestas[sesion.paso] = valor
         await avanzar_formulario(sesion)
     finally:
         sesion.ocupada = False
+
 
 async def finalizar_formulario(sesion: SesionReclutamiento):
     SESIONES.pop(sesion.user.id, None)
@@ -1695,7 +1711,7 @@ async def finalizar_formulario(sesion: SesionReclutamiento):
     fecha = datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y")
     r = sesion.respuestas
 
-    # Orden de las respuestas (7 preguntas):
+    # Orden de las respuestas:
     # r[0] cómo llegó | r[1] experiencia | r[2] foto INE | r[3] usuario de Roblox
     # r[4] foto de sus servidores de discord | r[5] respeto | r[6] compromiso
 
@@ -1704,8 +1720,10 @@ async def finalizar_formulario(sesion: SesionReclutamiento):
     creada_txt = f"<t:{int(usuario.created_at.timestamp())}:R>"
 
     try:
-        # Las fotos se suben a un canal y se guardan sus links para ponerlos como hipervínculo en la solicitud
-        canal_imagenes = (bot.get_channel(CANAL_IMAGENES_RECLUTAMIENTO_ID) if CANAL_IMAGENES_RECLUTAMIENTO_ID else None) or canal
+        canal_imagenes = (
+            bot.get_channel(CANAL_IMAGENES_RECLUTAMIENTO_ID)
+            if CANAL_IMAGENES_RECLUTAMIENTO_ID else None
+        ) or canal
 
         ine = await r[2].to_file(filename=f"ine_{usuario.id}{extension_archivo(r[2])}")
         servidores = await r[4].to_file(filename=f"servidores_{usuario.id}{extension_archivo(r[4])}")
@@ -1715,10 +1733,10 @@ async def finalizar_formulario(sesion: SesionReclutamiento):
             files=[ine, servidores],
             allowed_mentions=discord.AllowedMentions.none()
         )
+
         link_ine = msg_imagenes.attachments[0].url
         link_servidores = msg_imagenes.attachments[1].url
 
-        # "###" da un texto más grande que la negrita pero más pequeño que el título "#"
         embed = discord.Embed(
             description=(
                 f"# SOLICITUD DE RECLUTAMIENTO\n"
@@ -1744,17 +1762,19 @@ async def finalizar_formulario(sesion: SesionReclutamiento):
             color=COLOR_TELEVISA,
         )
 
-        # El campo Estado debe ser el primero (los botones lo editan)
         embed.add_field(name="Estado:", value="Pendiente", inline=True)
         embed.add_field(name="Fecha:", value=fecha, inline=True)
         embed.set_thumbnail(url=usuario.display_avatar.url)
-        # El ID del solicitante va en el pie (no lo puede alterar el usuario con sus respuestas)
-        embed.set_footer(text=f"{NOMBRE} • Solicitud {usuario.id}",
-                         icon_url=canal.guild.icon.url if canal.guild.icon else None)
+        embed.set_footer(
+            text=f"{NOMBRE} • Solicitud {usuario.id}",
+            icon_url=canal.guild.icon.url if canal.guild.icon else None
+        )
 
-        # El ping al rol va fuera del embed (en el content); al solicitante no se le hace ping
         if ROL_PING_RECLUTAMIENTO_ID:
-            permitidos = discord.AllowedMentions(roles=[discord.Object(id=ROL_PING_RECLUTAMIENTO_ID)], users=False)
+            permitidos = discord.AllowedMentions(
+                roles=[discord.Object(id=ROL_PING_RECLUTAMIENTO_ID)],
+                users=False
+            )
             contenido = f"<@&{ROL_PING_RECLUTAMIENTO_ID}>"
         else:
             permitidos = discord.AllowedMentions.none()
