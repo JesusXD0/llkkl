@@ -1497,7 +1497,7 @@ CANAL_LOGS_RECLUTAMIENTO_ID = 1568144615830196274             # Log de reclutami
 CANAL_IMAGENES_RECLUTAMIENTO_ID = 1554330185736650802        # Donde se guardan las fotos (INE / servidores). 0 = usa el canal de solicitudes
 ROL_PING_RECLUTAMIENTO_ID = 1568142087948345405              # Rol al que se le hace ping cuando llega una solicitud (0 = sin ping)
 ROL_ENLISTAMIENTO_ID = 1554362466564186142                   # Rol de "aspirante" que se le quita al aceptar (0 = no quita ninguno)
-ROLES_EXTRA_RECLUTAMIENTO_IDS = [1554367563440328734, 1554368070145937469]
+ROLES_EXTRA_RECLUTAMIENTO_IDS = [1554367563440328734, 1554368070145937469, 1554364688098267179]
 
 # Al aceptar se le dan: el separador del grupo 1 + el rango más bajo de JERARQUIA + los roles extra.
 URL_REQUISITOS = ""                        # Link de requisitos (opcional). Vacío = no sale la línea en el panel
