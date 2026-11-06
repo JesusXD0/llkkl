@@ -1491,13 +1491,13 @@ import uuid
 
 # CONFIGURACION DEL RECLUTAMIENTO -------------------------------------------------------------------------------------
 
-CANAL_RECLUTAMIENTO_ID = 0                 # Donde se publica el panel con el menú. 0 = el canal donde uses /panel-reclutamiento
-CANAL_SOLICITUDES_RECLUTAMIENTO_ID = 0     # OBLIGATORIO: aquí llegan las solicitudes (Aceptar / Rechazar)
-CANAL_LOGS_RECLUTAMIENTO_ID = 0            # Log de reclutamientos aceptados (opcional, 0 = no manda log)
-CANAL_IMAGENES_RECLUTAMIENTO_ID = 0        # Donde se guardan las fotos (INE / servidores). 0 = usa el canal de solicitudes
-ROL_PING_RECLUTAMIENTO_ID = 0              # Rol al que se le hace ping cuando llega una solicitud (0 = sin ping)
-ROL_ENLISTAMIENTO_ID = 0                   # Rol de "aspirante" que se le quita al aceptar (0 = no quita ninguno)
-ROLES_EXTRA_RECLUTAMIENTO_IDS = []         # Roles extra al aceptar (ej. Trabajador, Verificado). Ejemplo: [123, 456]
+CANAL_RECLUTAMIENTO_ID = 1554330185736650802                 # Donde se publica el panel con el menú. 0 = el canal donde uses /panel-reclutamiento
+CANAL_SOLICITUDES_RECLUTAMIENTO_ID = 1568144369511440515     # OBLIGATORIO: aquí llegan las solicitudes (Aceptar / Rechazar)
+CANAL_LOGS_RECLUTAMIENTO_ID = 1568144615830196274             # Log de reclutamientos aceptados (opcional, 0 = no manda log)
+CANAL_IMAGENES_RECLUTAMIENTO_ID = 1554330185736650802        # Donde se guardan las fotos (INE / servidores). 0 = usa el canal de solicitudes
+ROL_PING_RECLUTAMIENTO_ID = 1568142087948345405              # Rol al que se le hace ping cuando llega una solicitud (0 = sin ping)
+ROL_ENLISTAMIENTO_ID = 1554362466564186142                   # Rol de "aspirante" que se le quita al aceptar (0 = no quita ninguno)
+ROLES_EXTRA_RECLUTAMIENTO_IDS = [1554367563440328734, 1554368070145937469]
 
 # Al aceptar se le dan: el separador del grupo 1 + el rango más bajo de JERARQUIA + los roles extra.
 URL_REQUISITOS = ""                        # Link de requisitos (opcional). Vacío = no sale la línea en el panel
