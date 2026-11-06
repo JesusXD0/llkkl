@@ -493,7 +493,7 @@ class NoticiaModal(ModalBase, title="Crea tu Noticia"):
             )[:4096],
             color=COLOR_TELEVISA,
         )
-        embed.set_thumbnail(url=guild.icon.url if guild.icon else interaction.user.display_avatar.url)
+        embed.set_thumbnail(url=interaction.user.display_avatar.url)   # foto de perfil de quien sube la noticia
 
         try:
             files = [
