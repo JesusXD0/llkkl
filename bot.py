@@ -19,7 +19,7 @@ PIE_EMBED = NOMBRE                                       # pie fijo de las tarje
 
 CANAL_BIENVENIDA_ID = 1554327372919079043
 CANAL_DESPEDIDA_ID = 1554329826221883503
-CANAL_ASCENSOS_ID = 0    # Canal donde se publican ascensos y descensos. 0 = el mismo canal donde se usa el comando
+CANAL_ASCENSOS_ID = 1554335232617095179    # Canal donde se publican ascensos y descensos. 0 = el mismo canal donde se usa el comando
 
 # Zona horaria para la fecha de los ascensos (UTC-7). Cambia el -7 si necesitas otra.
 ZONA_HORARIA = timezone(timedelta(hours=-7))
