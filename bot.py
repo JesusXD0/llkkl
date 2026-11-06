@@ -2307,6 +2307,7 @@ async def reclutamiento_al_iniciar():
 # quiere recibir (esos roles son los que se mencionan cuando se publica una noticia).
 
 CANAL_PANEL_NOTICIAS_ID = 1568373659775541378
+ROL_SEGUIDOR_NOTICIAS_ID = 1568384431830597633
 
 
 def embed_panel_noticias(guild: discord.Guild, con_imagen: bool) -> discord.Embed:
@@ -2340,33 +2341,50 @@ async def alternar_rol_noticias(interaction: discord.Interaction, clave: str):
     guild = interaction.guild
     miembro = interaction.user
     rol = guild.get_role(cfg["rol"])
+    rol_seguidor = guild.get_role(ROL_SEGUIDOR_NOTICIAS_ID)
 
     if rol is None:
         return await interaction.response.send_message("No encontré ese rol en el servidor.", ephemeral=True)
-    if rol >= guild.me.top_role:
-        return await interaction.response.send_message(
-            "No puedo gestionar ese rol: está por encima o igual a mi rol más alto.", ephemeral=True)
+    if rol_seguidor is None:
+        return await interaction.response.send_message("No encontré el rol de seguidor de noticias en el servidor.", ephemeral=True)
+
+    roles_noticias = [guild.get_role(item["rol"]) for item in TIPOS_NOTICIA.values()]
+    roles_noticias = [r for r in roles_noticias if r is not None]
+    for rol_gestionado in (rol, rol_seguidor):
+        if rol_gestionado >= guild.me.top_role:
+            return await interaction.response.send_message(
+                f"No puedo gestionar el rol {rol_gestionado.mention}: está por encima o igual a mi rol más alto.",
+                ephemeral=True,
+            )
+
+    await interaction.response.defer(ephemeral=True)
+    tenia_rol = rol in miembro.roles
+    restantes = [r for r in roles_noticias if r in miembro.roles and r.id != rol.id]
+    agregar = []
+    quitar = []
+    if tenia_rol:
+        quitar.append(rol)
+        texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        if not restantes and rol_seguidor in miembro.roles:
+            quitar.append(rol_seguidor)
+    else:
+        agregar.append(rol)
+        texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        if rol_seguidor not in miembro.roles:
+            agregar.append(rol_seguidor)
 
     try:
-        if rol in miembro.roles:
-            await miembro.remove_roles(rol, reason="Panel de noticias")
-            texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
-        else:
-            await miembro.add_roles(rol, reason="Panel de noticias")
-            texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        if agregar:
+            await miembro.add_roles(*agregar, reason="Suscripción al panel de noticias")
+        if quitar:
+            await miembro.remove_roles(*quitar, reason="Suscripción al panel de noticias")
     except discord.Forbidden:
-        return await interaction.response.send_message(
-            "No pude cambiar tu rol. Avisa a un directivo.", ephemeral=True)
+        return await interaction.followup.send("No pude cambiar tus roles. Avisa a un directivo.", ephemeral=True)
+    except discord.HTTPException as e:
+        print(f" Error actualizando roles del panel de noticias: {e!r}")
+        return await interaction.followup.send("No pude completar el cambio de roles. Inténtalo de nuevo.", ephemeral=True)
 
-    await interaction.response.send_message(texto, ephemeral=True)
-
-    # Actualiza el contador de suscritos del panel
-    try:
-        con_imagen = any(a.filename == "fondo.png" for a in interaction.message.attachments)
-        await interaction.message.edit(embed=embed_panel_noticias(guild, con_imagen), view=PanelNoticiasView())
-    except Exception as e:
-        print(f" No pude actualizar el contador del panel de noticias: {e!r}")
-
+    await interaction.followup.send(texto, ephemeral=True)
 
 class PanelNoticiasView(discord.ui.View):
 
