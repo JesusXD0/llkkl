@@ -400,121 +400,228 @@ def es_video(archivo: discord.Attachment) -> bool:
     return archivo.filename.lower().endswith((".mp4", ".mov", ".webm", ".m4v"))
 
 
-class NoticiaModal(ModalBase, title="Crea tu Noticia"):
+NOTICIAS_BORRADORES: dict = {}   # uid -> noticia pendiente (título, texto, tipo y archivos). Vive en memoria: si el bot se reinicia, se pierde.
 
-    titulo = discord.ui.Label(
-        text="Título de la Noticia",
-        description="Especifica el título de la noticia",
-        component=discord.ui.TextInput(
-            placeholder="Ej: ¡Nuevo evento en la ciudad!",
-            max_length=150,
-        ),
+
+class _ModalNoticia(discord.ui.Modal):
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f" Error en el formulario de noticias: {error!r}")
+        if interaction.response.is_done():
+            await interaction.followup.send("Ocurrió un error con el formulario.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Ocurrió un error con el formulario.", ephemeral=True)
+
+
+def _mb(guild: discord.Guild) -> int:
+    return guild.filesize_limit // (1024 * 1024)
+
+
+async def publicar_noticia(guild: discord.Guild, autor: discord.abc.User, b: dict) -> dict:
+    # Valida y publica la noticia. Devuelve {"ok": bool, "texto": str}
+    cfg = TIPOS_NOTICIA[b["tipo"]]
+    archivos = b["archivos"]
+    imagenes = [a for a in archivos if es_imagen(a)]
+    videos = [a for a in archivos if not es_imagen(a) and es_video(a)]
+
+    if len(imagenes) + len(videos) != len(archivos):
+        return {"ok": False, "texto": "Solo puedes adjuntar imágenes, GIFs o videos (mp4, mov, webm)."}
+    if len(imagenes) > MAX_IMAGENES_NOTICIA:
+        return {"ok": False, "texto": f"Máximo {MAX_IMAGENES_NOTICIA} imágenes."}
+
+    pesados = [a for a in archivos if a.size > guild.filesize_limit]
+    if pesados:
+        lista = ", ".join(f"**{a.filename}** ({a.size / (1024 * 1024):.1f} MB)" for a in pesados)
+        return {"ok": False, "texto": f"Estos archivos pesan más de lo que permite este servidor ({_mb(guild)} MB): {lista}."}
+
+    canal = await _canal_por_id(cfg["canal"])
+    if canal is None:
+        return {"ok": False, "texto": f"No encontré el canal de noticias de {cfg['nombre']}."}
+
+    try:
+        files_img = [
+            await a.to_file(filename=f"noticia_{i}{extension_archivo(a)}")
+            for i, a in enumerate(imagenes, start=1)
+        ]
+        files_video = [
+            await a.to_file(filename=f"noticia_video_{i}{extension_archivo(a)}")
+            for i, a in enumerate(videos, start=1)
+        ]
+        medios = files_img + files_video
+
+        # Tarjeta V2: el ping al rol va arriba; dentro, texto + foto del autor a la derecha, y las imágenes/videos abajo
+        vista = discord.ui.LayoutView(timeout=None)
+        vista.add_item(discord.ui.TextDisplay(f"<@&{cfg['rol']}>"))
+
+        contenedor = discord.ui.Container(accent_colour=COLOR_TELEVISA)
+        contenedor.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(f"### {NOMBRE}\n## {b['titulo']}\n{b['contenido']}"),
+            accessory=discord.ui.Thumbnail(autor.display_avatar.url),   # foto de perfil de quien sube la noticia
+        ))
+        contenedor.add_item(discord.ui.TextDisplay(
+            f"{LINEA_NOTICIA}\n***Publicado por:*** {autor.mention}"
+        ))
+        if medios:
+            galeria = discord.ui.MediaGallery()
+            for archivo in medios:
+                galeria.add_item(media=f"attachment://{archivo.filename}")
+            contenedor.add_item(galeria)
+        vista.add_item(contenedor)
+
+        mensaje = await canal.send(
+            view=vista,
+            files=medios,
+            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=cfg["rol"])], users=False),
+        )
+    except Exception as e:
+        print(f" Error publicando la noticia: {e!r}")
+        return {"ok": False, "texto": f"Discord no la dejó enviar: `{type(e).__name__}: {e}`"}
+
+    return {"ok": True, "texto": f"Noticia publicada en {canal.mention}: {mensaje.jump_url}"}
+
+
+def texto_fallo_noticia(b: dict, r: dict) -> str:
+    return (
+        f"❌ **No se pudo publicar la noticia.**\n{r['texto']}\n\n"
+        f"💾 **Tu noticia quedó guardada** con su título, texto, tipo y {len(b['archivos'])} archivo(s). "
+        f"Elige qué hacer:"
     )
 
-    contenido = discord.ui.Label(
-        text="Contenido de la Noticia",
-        description="Escribe el contenido detallado de la noticia",
-        component=discord.ui.TextInput(
-            style=discord.TextStyle.paragraph,
-            placeholder="Escribe aquí el contenido de la noticia...",
-            max_length=3000,
-        ),
-    )
 
-    tipo = discord.ui.Label(
-        text="Tipo de noticia",
-        description="Elige el tipo de noticia que vas a publicar.",
-        component=discord.ui.Select(
-            placeholder="Elige un tipo",
-            options=[
-                discord.SelectOption(label=cfg["nombre"], value=clave, emoji=cfg["emoji"], description=cfg["desc"][:100])
-                for clave, cfg in TIPOS_NOTICIA.items()
-            ],
-        ),
-    )
+class RecuperarNoticiaView(discord.ui.View):
+    # Botones para restaurar una noticia que no se pudo enviar
 
-    imagenes = discord.ui.Label(
-        text="Imagen o Video de la Noticia",
-        description=f"Sube imágenes (máx. {MAX_IMAGENES_NOTICIA}) o videos relacionados con la noticia (Opcional)",
-        component=discord.ui.FileUpload(
-            min_values=0,
-            max_values=MAX_ARCHIVOS_NOTICIA,
-            required=False,
-        ),
-    )
+    def __init__(self, uid: int):
+        super().__init__(timeout=1800)
+        self.uid = uid
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.uid
+
+    @discord.ui.button(label="Reintentar", style=discord.ButtonStyle.success, emoji="🔁")
+    async def reintentar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        b = NOTICIAS_BORRADORES.get(self.uid)
+        if b is None:
+            return await interaction.response.edit_message(
+                content="Ya no tengo ese borrador guardado (se publicó, se descartó o el bot se reinició). Usa /noticia otra vez.",
+                view=None)
+
+        self.stop()
+        await interaction.response.edit_message(content="⏳ Reintentando…", view=None)
+        r = await publicar_noticia(interaction.guild, interaction.user, b)
+        if r["ok"]:
+            NOTICIAS_BORRADORES.pop(self.uid, None)
+            return await interaction.edit_original_response(content=f"✅ {r['texto']}", view=None)
+        await interaction.edit_original_response(content=texto_fallo_noticia(b, r), view=RecuperarNoticiaView(self.uid))
+
+    @discord.ui.button(label="Editar y reenviar", style=discord.ButtonStyle.primary, emoji="✏️")
+    async def editar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        b = NOTICIAS_BORRADORES.get(self.uid)
+        if b is None:
+            return await interaction.response.edit_message(
+                content="Ya no tengo ese borrador guardado. Usa /noticia otra vez.", view=None)
+        await interaction.response.send_modal(NoticiaModal(b))
+
+    @discord.ui.button(label="Descartar", style=discord.ButtonStyle.secondary, emoji="🗑️")
+    async def descartar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        NOTICIAS_BORRADORES.pop(self.uid, None)
+        self.stop()
+        await interaction.response.edit_message(content="🗑️ Borrador descartado.", view=None)
+
+
+class NoticiaModal(_ModalNoticia, title="Crea tu Noticia"):
+
+    def __init__(self, borrador: Optional[dict] = None):
+        super().__init__()
+        b = borrador or {}
+        self.borrador = borrador
+        if borrador:
+            self.title = "Editar tu Noticia"
+
+        guardados = len(b.get("archivos", []))
+        descripcion_archivos = (
+            f"Si no subes nada conservo tus {guardados} archivo(s) guardados. Sube nuevos para reemplazarlos."
+            if guardados else
+            f"Sube imágenes (máx. {MAX_IMAGENES_NOTICIA}) o videos relacionados con la noticia (Opcional)"
+        )
+
+        self.campo_titulo = discord.ui.Label(
+            text="Título de la Noticia",
+            description="Especifica el título de la noticia",
+            component=discord.ui.TextInput(
+                placeholder="Ej: ¡Nuevo evento en la ciudad!",
+                max_length=150,
+                default=b.get("titulo"),
+            ),
+        )
+        self.campo_contenido = discord.ui.Label(
+            text="Contenido de la Noticia",
+            description="Escribe el contenido detallado de la noticia",
+            component=discord.ui.TextInput(
+                style=discord.TextStyle.paragraph,
+                placeholder="Escribe aquí el contenido de la noticia...",
+                max_length=3000,
+                default=b.get("contenido"),
+            ),
+        )
+        self.campo_tipo = discord.ui.Label(
+            text="Tipo de noticia",
+            description="Elige el tipo de noticia que vas a publicar.",
+            component=discord.ui.Select(
+                placeholder="Elige un tipo",
+                options=[
+                    discord.SelectOption(
+                        label=cfg["nombre"], value=clave, emoji=cfg["emoji"],
+                        description=cfg["desc"][:100], default=(clave == b.get("tipo")),
+                    )
+                    for clave, cfg in TIPOS_NOTICIA.items()
+                ],
+            ),
+        )
+        self.campo_archivos = discord.ui.Label(
+            text="Imagen o Video de la Noticia",
+            description=descripcion_archivos[:100],
+            component=discord.ui.FileUpload(
+                min_values=0,
+                max_values=MAX_ARCHIVOS_NOTICIA,
+                required=False,
+            ),
+        )
+        for campo in (self.campo_titulo, self.campo_contenido, self.campo_tipo, self.campo_archivos):
+            self.add_item(campo)
 
     async def on_submit(self, interaction: discord.Interaction):
-
-        titulo = self.titulo.component.value.strip()
-        contenido = self.contenido.component.value.strip()
-        cfg = TIPOS_NOTICIA[self.tipo.component.values[0]]
-        archivos = list(self.imagenes.component.values or [])
-
-        imagenes = [a for a in archivos if es_imagen(a)]
-        videos = [a for a in archivos if not es_imagen(a) and es_video(a)]
-
-        if len(imagenes) + len(videos) != len(archivos):
-            return await interaction.response.send_message(
-                "Solo puedes adjuntar imágenes, GIFs o videos (mp4, mov, webm).", ephemeral=True)
-        if len(imagenes) > MAX_IMAGENES_NOTICIA:
-            return await interaction.response.send_message(
-                f"Máximo {MAX_IMAGENES_NOTICIA} imágenes.", ephemeral=True)
-        for a in archivos:
-            if a.size > interaction.guild.filesize_limit:
-                limite_mb = interaction.guild.filesize_limit // (1024 * 1024)
-                return await interaction.response.send_message(
-                    f"**{a.filename}** pesa más de lo que permite este servidor para subir archivos ({limite_mb} MB).",
-                    ephemeral=True)
-
-        canal = await _canal_por_id(cfg["canal"])
-        if canal is None:
-            return await interaction.response.send_message(
-                f"No encontré el canal de noticias de {cfg['nombre']}.", ephemeral=True)
-
-        # Volver a subir imágenes y videos puede tardar más de 3 segundos
+        # Se responde de inmediato: validar y volver a subir los archivos puede tardar más de 3 segundos
         await interaction.response.defer(ephemeral=True)
 
-        try:
-            files_img = [
-                await a.to_file(filename=f"noticia_{i}{extension_archivo(a)}")
-                for i, a in enumerate(imagenes, start=1)
-            ]
-            files_video = [
-                await a.to_file(filename=f"noticia_video_{i}{extension_archivo(a)}")
-                for i, a in enumerate(videos, start=1)
-            ]
-            medios = files_img + files_video
+        guild = interaction.guild
+        uid = interaction.user.id
+        nuevos = list(self.campo_archivos.component.values or [])
+        aviso = ""
 
-            # Tarjeta V2: el ping al rol va arriba; dentro, texto + foto del autor a la derecha, y las imágenes/videos abajo
-            vista = discord.ui.LayoutView(timeout=None)
-            vista.add_item(discord.ui.TextDisplay(f"<@&{cfg['rol']}>"))
+        if nuevos:
+            archivos = nuevos
+        else:
+            # Sin archivos nuevos: se conservan los del borrador, menos los que pesaban de más
+            previos = list(self.borrador["archivos"]) if self.borrador else []
+            archivos = [a for a in previos if a.size <= guild.filesize_limit]
+            if len(archivos) != len(previos):
+                aviso = f"\n-# Quité {len(previos) - len(archivos)} archivo(s) demasiado pesados del borrador."
 
-            contenedor = discord.ui.Container(accent_colour=COLOR_TELEVISA)
-            contenedor.add_item(discord.ui.Section(
-                discord.ui.TextDisplay(f"### {NOMBRE}\n## {titulo}\n{contenido}"),
-                accessory=discord.ui.Thumbnail(interaction.user.display_avatar.url),   # foto de perfil de quien sube la noticia
-            ))
-            contenedor.add_item(discord.ui.TextDisplay(
-                f"{LINEA_NOTICIA}\n***Publicado por:*** {interaction.user.mention}"
-            ))
-            if medios:
-                galeria = discord.ui.MediaGallery()
-                for archivo in medios:
-                    galeria.add_item(media=f"attachment://{archivo.filename}")
-                contenedor.add_item(galeria)
-            vista.add_item(contenedor)
+        b = {
+            "titulo": self.campo_titulo.component.value.strip(),
+            "contenido": self.campo_contenido.component.value.strip(),
+            "tipo": self.campo_tipo.component.values[0],
+            "archivos": archivos,
+        }
 
-            mensaje = await canal.send(
-                view=vista,
-                files=medios,
-                allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=cfg["rol"])], users=False),
-            )
-        except Exception as e:
-            print(f" Error publicando la noticia: {e!r}")
-            return await interaction.followup.send(
-                f"No pude publicar la noticia. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+        r = await publicar_noticia(guild, interaction.user, b)
+        if r["ok"]:
+            NOTICIAS_BORRADORES.pop(uid, None)
+            return await interaction.followup.send(f"✅ {r['texto']}{aviso}", ephemeral=True)
 
-        await interaction.followup.send(f"Noticia publicada en {canal.mention}: {mensaje.jump_url}", ephemeral=True)
+        NOTICIAS_BORRADORES[uid] = b
+        await interaction.followup.send(texto_fallo_noticia(b, r) + aviso, view=RecuperarNoticiaView(uid), ephemeral=True)
 
 
 @bot.tree.command(name="noticia", description="Crea y publica una noticia de Grupo Televisa")
@@ -2559,6 +2666,356 @@ async def despedir(
     await interaction.followup.send(
         f"{usuario.mention} fue despedido ({len(retirados)} rol(es) retirados).",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+import asyncio
+
+# TICKETS -------------------------------------------------------------------------------------------------------------
+# /panel-tickets pone el botón "🎫 Abrir Ticket" en un mensaje del bot (el ID de tu embed) o publica un panel nuevo.
+# Al pulsarlo se pide el "Motivo de ticket" y se crea un canal privado en la categoría de tickets.
+# Dentro del ticket sale una tarjeta con el motivo y el botón "🔒 Cerrar ticket" (lo puede usar quien lo abrió o el staff).
+
+CATEGORIA_TICKETS_ID = 1554385131869962291    # Categoría donde se crean los tickets
+CANAL_LOGS_TICKETS_ID = 0               # Canal de logs de tickets (opcional, 0 = sin logs)
+ROL_STAFF_TICKET_ID = 0                 # Rol del staff que ve y atiende los tickets (opcional, 0 = solo lo que dé la categoría)
+TICKET_NOMBRE = NOMBRE
+TICKET_COLOR = COLOR_TELEVISA
+
+
+def _ticket_dueno_id(canal) -> Optional[int]:
+    coincidencia = re.search(r"uid:(\d+)", getattr(canal, "topic", None) or "")
+    return int(coincidencia.group(1)) if coincidencia else None
+
+
+def _ticket_abierto_de(guild: discord.Guild, uid: int):
+    categoria = guild.get_channel(CATEGORIA_TICKETS_ID)
+    if not isinstance(categoria, discord.CategoryChannel):
+        return None
+    for canal in categoria.text_channels:
+        if _ticket_dueno_id(canal) == uid:
+            return canal
+    return None
+
+
+def _es_staff_ticket(usuario) -> bool:
+    if not isinstance(usuario, discord.Member):
+        return False
+    permisos = usuario.guild_permissions
+    if permisos.administrator or permisos.manage_channels:
+        return True
+    return bool(ROL_STAFF_TICKET_ID) and any(r.id == ROL_STAFF_TICKET_ID for r in usuario.roles)
+
+
+def _buscar_custom_id(componentes, custom_id: str) -> bool:
+    for c in componentes or []:
+        if getattr(c, "custom_id", None) == custom_id:
+            return True
+        hijos = getattr(c, "children", None)
+        if hijos and _buscar_custom_id(hijos, custom_id):
+            return True
+    return False
+
+
+async def ticket_log(titulo: str, partes: list):
+    if not CANAL_LOGS_TICKETS_ID:
+        return
+    try:
+        canal = bot.get_channel(CANAL_LOGS_TICKETS_ID) or await bot.fetch_channel(CANAL_LOGS_TICKETS_ID)
+        texto = f"# {titulo}\n\n" + "\n\n".join(f"**{n}**\n{v}" for n, v in partes)
+        contenedor = discord.ui.Container(accent_colour=TICKET_COLOR)
+        contenedor.add_item(discord.ui.TextDisplay(texto[:3800]))
+        contenedor.add_item(discord.ui.Separator())
+        contenedor.add_item(discord.ui.TextDisplay(f"-# {TICKET_NOMBRE} · Tickets"))
+        vista = discord.ui.LayoutView(timeout=None)
+        vista.add_item(contenedor)
+        await canal.send(view=vista, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f" Error enviando el log del ticket: {e!r}")
+
+
+class _ModalTicket(discord.ui.Modal):
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f" Error en el formulario del ticket: {error!r}")
+        if interaction.response.is_done():
+            await interaction.followup.send("Ocurrió un error con el formulario.", ephemeral=True)
+        else:
+            await interaction.response.send_message("Ocurrió un error con el formulario.", ephemeral=True)
+
+
+class TicketModal(_ModalTicket, title="Abrir Ticket"):
+
+    motivo = discord.ui.Label(
+        text="Motivo de ticket",
+        description="Cuéntanos por qué abres el ticket.",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="Escribe el motivo de tu ticket...",
+            max_length=1000,
+        ),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        usuario = interaction.user
+        motivo = self.motivo.component.value.strip()
+
+        categoria = guild.get_channel(CATEGORIA_TICKETS_ID)
+        if not isinstance(categoria, discord.CategoryChannel):
+            return await interaction.response.send_message(
+                "No encontré la categoría de tickets. Avisa a un directivo.", ephemeral=True)
+
+        # Crear el canal puede tardar más de 3 segundos
+        await interaction.response.defer(ephemeral=True)
+
+        existente = _ticket_abierto_de(guild, usuario.id)
+        if existente:
+            return await interaction.followup.send(f"Ya tienes un ticket abierto: {existente.mention}", ephemeral=True)
+
+        slug = re.sub(r"[^a-z0-9-]", "", usuario.name.lower().replace(" ", "-"))[:60] or str(usuario.id)
+        canal = None
+        try:
+            canal = await guild.create_text_channel(
+                name=f"ticket-{slug}",
+                category=categoria,
+                topic=f"Ticket de {usuario.name} | uid:{usuario.id}",
+                reason=f"Ticket abierto por {usuario}",
+            )
+            # Nadie lo ve salvo quien lo abrió, el staff y lo que ya dé la categoría
+            await canal.set_permissions(guild.default_role, view_channel=False, reason="Ticket privado")
+            await canal.set_permissions(
+                usuario, view_channel=True, send_messages=True, read_message_history=True,
+                attach_files=True, embed_links=True, reason="Dueño del ticket",
+            )
+            rol_staff = guild.get_role(ROL_STAFF_TICKET_ID) if ROL_STAFF_TICKET_ID else None
+            if rol_staff is not None:
+                await canal.set_permissions(
+                    rol_staff, view_channel=True, send_messages=True, read_message_history=True,
+                    attach_files=True, reason="Staff de tickets",
+                )
+
+            ahora = int(datetime.now(timezone.utc).timestamp())
+            ping = usuario.mention + (f" <@&{ROL_STAFF_TICKET_ID}>" if rol_staff is not None else "")
+
+            contenedor = discord.ui.Container(accent_colour=TICKET_COLOR)
+            contenedor.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(
+                    f"# 🎫 TICKET\n"
+                    f"**Solicitante:** {usuario.mention}\n\n"
+                    f"**Motivo de ticket:**\n{motivo}\n\n"
+                    f"**Abierto:** <t:{ahora}:F>"
+                ),
+                accessory=discord.ui.Thumbnail(usuario.display_avatar.url),
+            ))
+            contenedor.add_item(discord.ui.Separator())
+            contenedor.add_item(discord.ui.TextDisplay(f"-# {TICKET_NOMBRE} · Un miembro del staff te atenderá en breve."))
+            contenedor.add_item(FilaCerrarTicket())
+
+            vista = discord.ui.LayoutView(timeout=None)
+            vista.add_item(discord.ui.TextDisplay(ping))
+            vista.add_item(contenedor)
+
+            await canal.send(
+                view=vista,
+                allowed_mentions=discord.AllowedMentions(
+                    users=[usuario],
+                    roles=[discord.Object(id=ROL_STAFF_TICKET_ID)] if rol_staff is not None else False,
+                ),
+            )
+        except Exception as e:
+            print(f" Error creando el ticket de {usuario}: {e!r}")
+            if canal is not None:
+                try:
+                    await canal.delete(reason="Falló la creación del ticket")
+                except Exception:
+                    pass
+            return await interaction.followup.send(
+                "No pude crear el ticket. Revisa que el bot tenga **Gestionar canales** y **Gestionar roles**.",
+                ephemeral=True)
+
+        await ticket_log("TICKET ABIERTO", [
+            ("Usuario", f"{usuario.mention} (`{usuario.id}`)"),
+            ("Motivo de ticket", motivo),
+            ("Canal", canal.mention),
+        ])
+        await interaction.followup.send(f"Tu ticket fue creado: {canal.mention}", ephemeral=True)
+
+
+async def abrir_ticket(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not isinstance(guild.get_channel(CATEGORIA_TICKETS_ID), discord.CategoryChannel):
+        return await interaction.response.send_message(
+            "No encontré la categoría de tickets. Avisa a un directivo.", ephemeral=True)
+
+    existente = _ticket_abierto_de(guild, interaction.user.id)
+    if existente:
+        return await interaction.response.send_message(
+            f"Ya tienes un ticket abierto: {existente.mention}", ephemeral=True)
+
+    await interaction.response.send_modal(TicketModal())
+
+
+class ConfirmarCierreTicketView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Sí, cerrar ticket", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal = interaction.channel
+        dueno = _ticket_dueno_id(canal)
+        if dueno is None or (interaction.user.id != dueno and not _es_staff_ticket(interaction.user)):
+            return await interaction.response.edit_message(content="No puedes cerrar este ticket.", view=None)
+
+        self.stop()
+        await interaction.response.edit_message(content="🔒 Cerrando el ticket…", view=None)
+        await ticket_log("TICKET CERRADO", [
+            ("Ticket", f"#{canal.name}"),
+            ("Dueño", f"<@{dueno}> (`{dueno}`)"),
+            ("Cerrado por", f"{interaction.user.mention}"),
+        ])
+        await asyncio.sleep(3)
+        try:
+            await canal.delete(reason=f"Ticket cerrado por {interaction.user}")
+        except Exception as e:
+            print(f" No pude borrar el canal del ticket: {e!r}")
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="El ticket sigue abierto.", view=None)
+
+
+async def cerrar_ticket(interaction: discord.Interaction):
+    dueno = _ticket_dueno_id(interaction.channel)
+    if dueno is None:
+        return await interaction.response.send_message("Este canal no es un ticket.", ephemeral=True)
+    if interaction.user.id != dueno and not _es_staff_ticket(interaction.user):
+        return await interaction.response.send_message(
+            "Solo quien abrió el ticket o el staff puede cerrarlo.", ephemeral=True)
+    await interaction.response.send_message(
+        "¿Seguro que quieres cerrar este ticket? Se eliminará el canal.",
+        view=ConfirmarCierreTicketView(), ephemeral=True)
+
+
+class FilaTicket(discord.ui.ActionRow):
+    # Botón "🎫 Abrir Ticket" para mensajes V2 (tarjetas)
+
+    @discord.ui.button(label="Abrir Ticket", emoji="🎫", style=discord.ButtonStyle.secondary, custom_id="ticket_abrir")
+    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await abrir_ticket(interaction)
+
+
+class FilaCerrarTicket(discord.ui.ActionRow):
+
+    @discord.ui.button(label="Cerrar ticket", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="ticket_cerrar")
+    async def cerrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cerrar_ticket(interaction)
+
+
+class TicketLayoutView(discord.ui.LayoutView):
+    # Solo sirve para que el botón siga funcionando después de reiniciar el bot
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(FilaTicket())
+        self.add_item(FilaCerrarTicket())
+
+
+class PanelTicketView(discord.ui.View):
+    # Botón "🎫 Abrir Ticket" para mensajes normales (embed clásico)
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Abrir Ticket", emoji="🎫", style=discord.ButtonStyle.secondary, custom_id="ticket_abrir")
+    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await abrir_ticket(interaction)
+
+
+@bot.tree.command(name="panel-tickets", description="Pone el botón 🎫 Abrir Ticket en un mensaje (o publica un panel nuevo)")
+@app_commands.describe(mensaje_id="ID (o link) de un mensaje del bot, tu embed, al que se le pone el botón. Vacío = panel nuevo")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_tickets(interaction: discord.Interaction, mensaje_id: Optional[str] = None):
+    guild = interaction.guild
+
+    if not isinstance(guild.get_channel(CATEGORIA_TICKETS_ID), discord.CategoryChannel):
+        return await interaction.response.send_message(
+            "No encontré la categoría de tickets. Revisa CATEGORIA_TICKETS_ID.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # ---- Panel nuevo (sin ID) ----
+    if not mensaje_id:
+        contenedor = discord.ui.Container(accent_colour=TICKET_COLOR)
+        contenedor.add_item(discord.ui.TextDisplay(
+            f"# 🎫 SOPORTE\n"
+            f"¿Necesitas ayuda o quieres hablar con el staff de **{TICKET_NOMBRE}**?\n"
+            f"Pulsa el botón, cuéntanos el motivo y abriremos un ticket privado para ti."
+        ))
+        contenedor.add_item(FilaTicket())
+        vista = discord.ui.LayoutView(timeout=None)
+        vista.add_item(contenedor)
+        try:
+            mensaje = await interaction.channel.send(view=vista)
+        except Exception as e:
+            return await interaction.followup.send(f"No pude publicar el panel. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+        return await interaction.followup.send(f"Panel de tickets publicado: {mensaje.jump_url}", ephemeral=True)
+
+    # ---- Ponerle el botón a un mensaje que ya existe ----
+    canal = interaction.channel
+    texto = mensaje_id.strip()
+    enlace = re.search(r"channels/(\d+)/(\d+)/(\d+)", texto)
+    try:
+        if enlace:
+            if int(enlace.group(1)) != guild.id:
+                return await interaction.followup.send("Ese mensaje no es de este servidor.", ephemeral=True)
+            canal = guild.get_channel_or_thread(int(enlace.group(2))) or await bot.fetch_channel(int(enlace.group(2)))
+            numero = int(enlace.group(3))
+        else:
+            numero = int(texto)
+        mensaje = await canal.fetch_message(numero)
+    except (ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return await interaction.followup.send(
+            "No encontré ese mensaje. Usa el comando en el mismo canal del mensaje o pega su link.", ephemeral=True)
+
+    if mensaje.author.id != bot.user.id:
+        return await interaction.followup.send(
+            "Ese mensaje no es del bot, así que no le puedo poner el botón. Publica tu embed con /embed y usa su ID.",
+            ephemeral=True)
+
+    if _buscar_custom_id(mensaje.components, "ticket_abrir"):
+        return await interaction.followup.send("Ese mensaje ya tiene el botón de tickets.", ephemeral=True)
+
+    try:
+        if getattr(mensaje.flags, "components_v2", False):
+            # Mensaje V2 (tarjeta): se conserva todo y se agrega el botón al final
+            vista = discord.ui.LayoutView.from_message(mensaje, timeout=None)
+            vista.add_item(FilaTicket())
+            await mensaje.edit(view=vista, attachments=list(mensaje.attachments))
+        else:
+            await mensaje.edit(view=PanelTicketView())
+    except Exception as e:
+        print(f" Error poniendo el botón de tickets: {e!r}")
+        return await interaction.followup.send(
+            f"No pude ponerle el botón a ese mensaje. Error: `{type(e).__name__}: {e}`\n"
+            f"Puedes usar `/panel-tickets` sin ID para publicar un panel nuevo.", ephemeral=True)
+
+    await interaction.followup.send(f"Botón agregado: {mensaje.jump_url}", ephemeral=True)
+
+
+_INICIO_TICKETS = {"hecho": False}
+
+
+@bot.listen("on_ready")
+async def tickets_al_iniciar():
+    # Recupera los botones de tickets después de reiniciar el bot
+    if _INICIO_TICKETS["hecho"]:
+        return
+    _INICIO_TICKETS["hecho"] = True
+    bot.add_view(TicketLayoutView())
+    bot.add_view(PanelTicketView())
 
 
 # TARJETAS V2 AUTOMATICAS ---------------------------------------------------------------------------------------------
