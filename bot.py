@@ -372,8 +372,8 @@ async def descender(interaction: discord.Interaction, usuario: discord.Member,
 # Según el tipo, la noticia se publica en su canal y se menciona al rol de ese tipo.
 
 MAX_IMAGENES_NOTICIA = 6
+MAX_ARCHIVOS_NOTICIA = 10   # máximo de archivos por mensaje en Discord (imágenes + videos)
 LINEA_NOTICIA = "\\_" * 15   # línea de guiones bajos antes de "Publicado por"
-IMAGENES_POR_GALERIA = 4   # Discord junta como máximo 4 imágenes en una misma galería de embeds
 
 TIPOS_NOTICIA = {
     "seguridad": {
@@ -394,22 +394,10 @@ TIPOS_NOTICIA = {
 }
 
 
-def armar_embeds_noticia(embed: discord.Embed, files: list) -> list:
-    """Pone las imágenes ABAJO de la noticia. Cada 4 imágenes se juntan en una galería (límite de Discord)."""
-    embeds = [embed]
-    for g, inicio in enumerate(range(0, len(files), IMAGENES_POR_GALERIA)):
-        grupo = files[inicio:inicio + IMAGENES_POR_GALERIA]
-        url = f"https://discord.com/#noticia{g}"   # misma URL en la galería para que Discord junte las imágenes
-        for i, archivo in enumerate(grupo):
-            if g == 0 and i == 0:
-                destino = embed
-            else:
-                destino = discord.Embed(color=COLOR_TELEVISA)
-                embeds.append(destino)
-            if len(grupo) > 1:
-                destino.url = url
-            destino.set_image(url=f"attachment://{archivo.filename}")
-    return embeds
+def es_video(archivo: discord.Attachment) -> bool:
+    if archivo.content_type and archivo.content_type.startswith("video/"):
+        return True
+    return archivo.filename.lower().endswith((".mp4", ".mov", ".webm", ".m4v"))
 
 
 class NoticiaModal(ModalBase, title="Crea tu Noticia"):
@@ -446,11 +434,11 @@ class NoticiaModal(ModalBase, title="Crea tu Noticia"):
     )
 
     imagenes = discord.ui.Label(
-        text="Imagen de la Noticia",
-        description=f"Sube una imagen relacionada con la noticia (Opcional, máximo {MAX_IMAGENES_NOTICIA})",
+        text="Imagen o Video de la Noticia",
+        description=f"Sube imágenes (máx. {MAX_IMAGENES_NOTICIA}) o videos relacionados con la noticia (Opcional)",
         component=discord.ui.FileUpload(
             min_values=0,
-            max_values=MAX_IMAGENES_NOTICIA,
+            max_values=MAX_ARCHIVOS_NOTICIA,
             required=False,
         ),
     )
@@ -462,48 +450,63 @@ class NoticiaModal(ModalBase, title="Crea tu Noticia"):
         cfg = TIPOS_NOTICIA[self.tipo.component.values[0]]
         archivos = list(self.imagenes.component.values or [])
 
-        if len(archivos) > MAX_IMAGENES_NOTICIA:
+        imagenes = [a for a in archivos if es_imagen(a)]
+        videos = [a for a in archivos if not es_imagen(a) and es_video(a)]
+
+        if len(imagenes) + len(videos) != len(archivos):
+            return await interaction.response.send_message(
+                "Solo puedes adjuntar imágenes, GIFs o videos (mp4, mov, webm).", ephemeral=True)
+        if len(imagenes) > MAX_IMAGENES_NOTICIA:
             return await interaction.response.send_message(
                 f"Máximo {MAX_IMAGENES_NOTICIA} imágenes.", ephemeral=True)
-
         for a in archivos:
-            if not es_imagen(a):
-                return await interaction.response.send_message("Los archivos deben ser imágenes o GIFs.", ephemeral=True)
             if a.size > interaction.guild.filesize_limit:
+                limite_mb = interaction.guild.filesize_limit // (1024 * 1024)
                 return await interaction.response.send_message(
-                    "Una imagen pesa más de lo que permite este servidor para subir archivos.", ephemeral=True)
+                    f"**{a.filename}** pesa más de lo que permite este servidor para subir archivos ({limite_mb} MB).",
+                    ephemeral=True)
 
         canal = await _canal_por_id(cfg["canal"])
         if canal is None:
             return await interaction.response.send_message(
                 f"No encontré el canal de noticias de {cfg['nombre']}.", ephemeral=True)
 
-        # Volver a subir las imágenes puede tardar más de 3 segundos
+        # Volver a subir imágenes y videos puede tardar más de 3 segundos
         await interaction.response.defer(ephemeral=True)
 
-        guild = interaction.guild
-        # La línea de guiones bajos y "Publicado por" van siempre al final, igual que en MXRP
-        embed = discord.Embed(
-            description=(
-                f"### {NOMBRE}\n"
-                f"## {titulo}\n"
-                f"{contenido}\n\n"
-                f"{LINEA_NOTICIA}\n"
-                f"***Publicado por:*** {interaction.user.mention}"
-            )[:4096],
-            color=COLOR_TELEVISA,
-        )
-        embed.set_thumbnail(url=interaction.user.display_avatar.url)   # foto de perfil de quien sube la noticia
-
         try:
-            files = [
+            files_img = [
                 await a.to_file(filename=f"noticia_{i}{extension_archivo(a)}")
-                for i, a in enumerate(archivos, start=1)
+                for i, a in enumerate(imagenes, start=1)
             ]
+            files_video = [
+                await a.to_file(filename=f"noticia_video_{i}{extension_archivo(a)}")
+                for i, a in enumerate(videos, start=1)
+            ]
+            medios = files_img + files_video
+
+            # Tarjeta V2: el ping al rol va arriba; dentro, texto + foto del autor a la derecha, y las imágenes/videos abajo
+            vista = discord.ui.LayoutView(timeout=None)
+            vista.add_item(discord.ui.TextDisplay(f"<@&{cfg['rol']}>"))
+
+            contenedor = discord.ui.Container(accent_colour=COLOR_TELEVISA)
+            contenedor.add_item(discord.ui.Section(
+                discord.ui.TextDisplay(f"### {NOMBRE}\n## {titulo}\n{contenido}"),
+                accessory=discord.ui.Thumbnail(interaction.user.display_avatar.url),   # foto de perfil de quien sube la noticia
+            ))
+            contenedor.add_item(discord.ui.TextDisplay(
+                f"{LINEA_NOTICIA}\n***Publicado por:*** {interaction.user.mention}"
+            ))
+            if medios:
+                galeria = discord.ui.MediaGallery()
+                for archivo in medios:
+                    galeria.add_item(media=f"attachment://{archivo.filename}")
+                contenedor.add_item(galeria)
+            vista.add_item(contenedor)
+
             mensaje = await canal.send(
-                content=f"<@&{cfg['rol']}>",
-                embeds=armar_embeds_noticia(embed, files),
-                files=files,
+                view=vista,
+                files=medios,
                 allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=cfg["rol"])], users=False),
             )
         except Exception as e:
@@ -2307,7 +2310,6 @@ async def reclutamiento_al_iniciar():
 # quiere recibir (esos roles son los que se mencionan cuando se publica una noticia).
 
 CANAL_PANEL_NOTICIAS_ID = 1568373659775541378
-ROL_SEGUIDOR_NOTICIAS_ID = 1568384431830597633
 
 
 def embed_panel_noticias(guild: discord.Guild, con_imagen: bool) -> discord.Embed:
@@ -2341,50 +2343,33 @@ async def alternar_rol_noticias(interaction: discord.Interaction, clave: str):
     guild = interaction.guild
     miembro = interaction.user
     rol = guild.get_role(cfg["rol"])
-    rol_seguidor = guild.get_role(ROL_SEGUIDOR_NOTICIAS_ID)
 
     if rol is None:
         return await interaction.response.send_message("No encontré ese rol en el servidor.", ephemeral=True)
-    if rol_seguidor is None:
-        return await interaction.response.send_message("No encontré el rol de seguidor de noticias en el servidor.", ephemeral=True)
-
-    roles_noticias = [guild.get_role(item["rol"]) for item in TIPOS_NOTICIA.values()]
-    roles_noticias = [r for r in roles_noticias if r is not None]
-    for rol_gestionado in (rol, rol_seguidor):
-        if rol_gestionado >= guild.me.top_role:
-            return await interaction.response.send_message(
-                f"No puedo gestionar el rol {rol_gestionado.mention}: está por encima o igual a mi rol más alto.",
-                ephemeral=True,
-            )
-
-    await interaction.response.defer(ephemeral=True)
-    tenia_rol = rol in miembro.roles
-    restantes = [r for r in roles_noticias if r in miembro.roles and r.id != rol.id]
-    agregar = []
-    quitar = []
-    if tenia_rol:
-        quitar.append(rol)
-        texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
-        if not restantes and rol_seguidor in miembro.roles:
-            quitar.append(rol_seguidor)
-    else:
-        agregar.append(rol)
-        texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
-        if rol_seguidor not in miembro.roles:
-            agregar.append(rol_seguidor)
+    if rol >= guild.me.top_role:
+        return await interaction.response.send_message(
+            "No puedo gestionar ese rol: está por encima o igual a mi rol más alto.", ephemeral=True)
 
     try:
-        if agregar:
-            await miembro.add_roles(*agregar, reason="Suscripción al panel de noticias")
-        if quitar:
-            await miembro.remove_roles(*quitar, reason="Suscripción al panel de noticias")
+        if rol in miembro.roles:
+            await miembro.remove_roles(rol, reason="Panel de noticias")
+            texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        else:
+            await miembro.add_roles(rol, reason="Panel de noticias")
+            texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
     except discord.Forbidden:
-        return await interaction.followup.send("No pude cambiar tus roles. Avisa a un directivo.", ephemeral=True)
-    except discord.HTTPException as e:
-        print(f" Error actualizando roles del panel de noticias: {e!r}")
-        return await interaction.followup.send("No pude completar el cambio de roles. Inténtalo de nuevo.", ephemeral=True)
+        return await interaction.response.send_message(
+            "No pude cambiar tu rol. Avisa a un directivo.", ephemeral=True)
 
-    await interaction.followup.send(texto, ephemeral=True)
+    await interaction.response.send_message(texto, ephemeral=True)
+
+    # Actualiza el contador de suscritos del panel
+    try:
+        con_imagen = any(a.filename == "fondo.png" for a in interaction.message.attachments)
+        await interaction.message.edit(embed=embed_panel_noticias(guild, con_imagen), view=PanelNoticiasView())
+    except Exception as e:
+        print(f" No pude actualizar el contador del panel de noticias: {e!r}")
+
 
 class PanelNoticiasView(discord.ui.View):
 
@@ -2535,28 +2520,38 @@ async def despedir(
         print(f" Error despidiendo a {usuario}: {e!r}")
         return await interaction.followup.send("No pude despedir al usuario. Revisa la consola del bot.", ephemeral=True)
 
-    embed = discord.Embed(
-        description=(
-            f"# DESPIDO\n\n"
-            f"**Usuario despedido:**\n{usuario.mention}\n\n"
-            f"**Motivo:**\n{motivo}\n\n"
-            f"**ID de usuario:**\n{usuario.id}"
-        ),
-        color=COLOR_TELEVISA,
-    )
-    embed.add_field(name="Fecha:", value=datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y"), inline=True)
-    # Foto pequeña arriba a la izquierda: la foto de perfil de quien despide
-    embed.set_author(name=f"Despide: {autor.display_name}", icon_url=autor.display_avatar.url)
-    embed.set_footer(text=NOMBRE, icon_url=guild.icon.url if guild.icon else None)
+    fecha = datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y")
 
-    kwargs = {}
+    contenedor = discord.ui.Container(accent_colour=COLOR_TELEVISA)
+    # La foto de perfil de quien despide va en la cabecera de la tarjeta
+    contenedor.add_item(discord.ui.Section(
+        discord.ui.TextDisplay(f"# DESPIDO\n**Despide:** {autor.mention}"),
+        accessory=discord.ui.Thumbnail(autor.display_avatar.url),
+    ))
+    contenedor.add_item(discord.ui.Separator())
+    contenedor.add_item(discord.ui.TextDisplay(
+        f"**Usuario despedido:**\n{usuario.mention}\n\n"
+        f"**Motivo:**\n{motivo}\n\n"
+        f"**ID de usuario:**\n{usuario.id}\n\n"
+        f"**Fecha:**\n{fecha}"
+    ))
+
+    archivos = []
     if imagen is not None:
         nombre = f"despido{extension_archivo(imagen)}"
-        kwargs["file"] = await imagen.to_file(filename=nombre)
-        embed.set_image(url=f"attachment://{nombre}")
+        archivos.append(await imagen.to_file(filename=nombre))
+        galeria = discord.ui.MediaGallery()
+        galeria.add_item(media=f"attachment://{nombre}")
+        contenedor.add_item(galeria)
+
+    contenedor.add_item(discord.ui.Separator())
+    contenedor.add_item(discord.ui.TextDisplay(f"-# {NOMBRE}"))
+
+    vista = discord.ui.LayoutView(timeout=None)
+    vista.add_item(contenedor)
 
     try:
-        await canal.send(embed=embed, allowed_mentions=discord.AllowedMentions.none(), **kwargs)
+        await canal.send(view=vista, files=archivos, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f" Error enviando el aviso de despido: {e!r}")
         return await interaction.followup.send("El usuario fue despedido, pero no pude enviar el aviso.", ephemeral=True)
@@ -2564,6 +2559,121 @@ async def despedir(
     await interaction.followup.send(
         f"{usuario.mention} fue despedido ({len(retirados)} rol(es) retirados).",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# TARJETAS V2 AUTOMATICAS ---------------------------------------------------------------------------------------------
+# Todo mensaje con embed que el bot MANDA a un canal del servidor (bienvenidas, despedidas, ascensos, logs...) se
+# convierte solo en una tarjeta V2 con el MISMO texto, campos, imágenes, miniatura y pie. No se convierten:
+#  - los mensajes con botones o menús (panel de reclutamiento, solicitudes, panel de noticias): el bot los necesita así,
+#  - los mensajes privados (DM) ni las respuestas ocultas.
+# Si Discord rechazara la tarjeta, el mensaje se manda como embed normal para no perderlo.
+
+_ENVIAR_ORIGINAL = discord.abc.Messageable.send
+CANALES_SIN_V2 = set()   # IDs de canales donde NO quieres tarjetas V2 (ejemplo: {1554327372919079043})
+
+
+def _layout_desde_embeds(embeds: list, contenido) -> discord.ui.LayoutView:
+    principal = embeds[0]
+
+    partes = []
+    if principal.author and principal.author.name:
+        partes.append(f"-# {principal.author.name}")
+    if principal.title:
+        partes.append(f"## {principal.title}")
+    if principal.description:
+        partes.append(principal.description)
+    for e in embeds:
+        for campo in e.fields:
+            partes.append(f"**{campo.name}**\n{campo.value}")
+    texto = ("\n\n".join(partes) or "\u200b")[:3400]
+
+    imagenes = [e.image.url for e in embeds if e.image.url][:10]
+    miniatura = principal.thumbnail.url
+
+    contenedor = discord.ui.Container(accent_colour=principal.colour)
+    agregado = False
+    if miniatura:
+        try:
+            contenedor.add_item(discord.ui.Section(discord.ui.TextDisplay(texto), accessory=discord.ui.Thumbnail(miniatura)))
+            agregado = True
+        except Exception:
+            agregado = False
+    if not agregado:
+        contenedor.add_item(discord.ui.TextDisplay(texto))
+
+    if imagenes:
+        contenedor.add_item(discord.ui.MediaGallery(*[discord.MediaGalleryItem(u) for u in imagenes]))
+
+    pie = principal.footer.text or ""
+    if principal.timestamp:
+        pie = (pie + " · " if pie else "") + f"<t:{int(principal.timestamp.timestamp())}:f>"
+    if pie:
+        contenedor.add_item(discord.ui.Separator())
+        contenedor.add_item(discord.ui.TextDisplay(f"-# {pie}"[:250]))
+
+    vista = discord.ui.LayoutView()
+    if contenido:
+        vista.add_item(discord.ui.TextDisplay(str(contenido)[:250]))   # los pings van arriba de la tarjeta
+    vista.add_item(contenedor)
+    return vista
+
+
+def _kwargs_v2(kwargs: dict) -> Optional[dict]:
+    embeds = list(kwargs.get("embeds") or [])
+    if kwargs.get("embed") is not None:
+        embeds.insert(0, kwargs["embed"])
+    if not embeds:
+        return None
+
+    vista = _layout_desde_embeds(embeds, kwargs.get("content"))
+
+    # Solo se suben los archivos que la tarjeta realmente muestra
+    usados = set()
+    for e in embeds:
+        for url in (e.image.url, e.thumbnail.url):
+            if url and url.startswith("attachment://"):
+                usados.add(url[len("attachment://"):])
+    archivos = list(kwargs.get("files") or [])
+    if kwargs.get("file") is not None:
+        archivos.append(kwargs["file"])
+    archivos = [a for a in archivos if a.filename in usados]
+
+    nuevos = {k: v for k, v in kwargs.items() if k not in ("embed", "embeds", "content", "file", "files")}
+    if archivos:
+        nuevos["files"] = archivos
+    nuevos["view"] = vista
+    return nuevos
+
+
+async def _enviar_con_v2(self, *args, **kwargs):
+    nuevos = None
+    try:
+        if (not args
+                and isinstance(self, (discord.TextChannel, discord.Thread))
+                and getattr(self, "id", None) not in CANALES_SIN_V2
+                and (kwargs.get("embed") is not None or kwargs.get("embeds"))
+                and kwargs.get("view") is None):
+            nuevos = _kwargs_v2(kwargs)
+    except Exception as e:
+        print(f" No pude convertir el embed a tarjeta V2: {e!r}")
+        nuevos = None
+
+    if nuevos is None:
+        return await _ENVIAR_ORIGINAL(self, *args, **kwargs)
+
+    try:
+        return await _ENVIAR_ORIGINAL(self, **nuevos)
+    except (discord.HTTPException, TypeError, ValueError) as e:
+        print(f" La tarjeta V2 falló ({e!r}); se manda como embed normal.")
+        for archivo in list(kwargs.get("files") or []) + ([kwargs["file"]] if kwargs.get("file") is not None else []):
+            try:
+                archivo.reset()
+            except Exception:
+                pass
+        return await _ENVIAR_ORIGINAL(self, *args, **kwargs)
+
+
+discord.abc.Messageable.send = _enviar_con_v2
 
 
 # INICIAR BOT
