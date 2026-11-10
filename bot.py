@@ -3132,7 +3132,489 @@ async def _enviar_con_v2(self, *args, **kwargs):
 
 discord.abc.Messageable.send = _enviar_con_v2
 
+import time
 
+# =====================================================================================================================
+# PEGA TODO ESTO en bot.py, justo ANTES de la línea "# INICIAR BOT" (después del bloque de TARJETAS V2 AUTOMATICAS).
+# No necesita nada más: registra sus propios botones y eventos al iniciar.
+#
+# Comandos nuevos:
+#   /panel-personal   (admin)  publica el panel de personal por jerarquía
+#   /panel-registro   (admin)  publica el panel de conteo de noticias en el canal 1554334830018433055
+#   /registro                  registra una noticia (el aviso sale en el canal 1554338479956037633)
+#   /conteo-noticias  (admin)  corrige manualmente el conteo de alguien
+#   /pagos                     registra un pago con fotos de prueba y menciona al trabajador
+# =====================================================================================================================
+
+# PANELES DE PERSONAL / REGISTRO DE NOTICIAS / PAGOS ------------------------------------------------------------------
+
+CANAL_PANEL_PERSONAL_ID = 0                          # Donde va el panel de personal. 0 = el canal donde uses /panel-personal
+CANAL_PANEL_REGISTRO_ID = 1554334830018433055        # Panel con el conteo de noticias por trabajador
+CANAL_REGISTRO_NOTICIAS_ID = 1554338479956037633     # Aquí llegan los /registro
+ROL_PING_REGISTRO_ID = 1568142087948345405           # Rol que se menciona (fuera del embed) en cada registro
+CANAL_PAGOS_ID = 0                                   # Donde se publican los pagos. 0 = el canal donde uses /pagos
+
+MAX_DESC_PANEL = 4000
+RUTA_PERSONAL = os.path.join(CARPETA_DATOS, "paneles_personal.json")
+
+
+def _cargar_personal() -> dict:
+    try:
+        with open(RUTA_PERSONAL, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        if not isinstance(datos, dict):
+            datos = {}
+    except FileNotFoundError:
+        datos = {}
+    except Exception as e:
+        print(f" No pude leer {RUTA_PERSONAL}: {e}")
+        datos = {}
+    datos.setdefault("paneles", {})   # {"personal": {"canal": id, "mensajes": [ids]}, "registro": {...}}
+    datos.setdefault("conteos", {})   # {"id_usuario": cantidad de noticias}
+    return datos
+
+
+DATOS_PERSONAL: dict = _cargar_personal()
+
+
+def _guardar_personal():
+    try:
+        os.makedirs(CARPETA_DATOS, exist_ok=True)
+        tmp = RUTA_PERSONAL + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(DATOS_PERSONAL, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, RUTA_PERSONAL)
+    except Exception as e:
+        print(f" No pude guardar {RUTA_PERSONAL}: {e}")
+
+
+def _conteo(uid: int) -> int:
+    return int(DATOS_PERSONAL["conteos"].get(str(uid), 0))
+
+
+def _trabajadores_por_rango(guild: discord.Guild) -> dict:
+    """índice de JERARQUIA -> lista de miembros cuyo rango más alto es ese."""
+    por_rango = {i: [] for i in range(len(JERARQUIA))}
+    for m in guild.members:
+        if m.bot:
+            continue
+        i = obtener_rango_actual(m)
+        if i >= 0:
+            por_rango[i].append(m)
+    return por_rango
+
+
+def _recortar(texto: str, limite: int = MAX_DESC_PANEL) -> str:
+    if len(texto) <= limite:
+        return texto
+    corte = texto.rfind("\n", 0, limite - 70)
+    return texto[:corte if corte > 0 else limite - 70] + "\n-# … lista recortada por el límite de Discord"
+
+
+def _embeds_panel(clave: str, guild: discord.Guild) -> list:
+    """Un embed por grupo (de EJECUTIVOS hacia abajo). Cada uno es un mensaje, así no se pasa del límite."""
+    por_rango = _trabajadores_por_rango(guild)
+    total = sum(len(v) for v in por_rango.values())
+
+    if clave == "personal":
+        titulo = f"# 👥 PERSONAL DE {NOMBRE.upper()}\n-# {total} trabajadores en total\n\n"
+        for v in por_rango.values():
+            v.sort(key=lambda m: m.display_name.lower())
+
+        def linea(m):
+            return m.mention
+    else:
+        total_n = sum(_conteo(m.id) for v in por_rango.values() for m in v)
+        titulo = f"# 📰 REGISTRO DE NOTICIAS\n-# {total} trabajadores · {total_n} noticias en total\n\n"
+        for v in por_rango.values():
+            v.sort(key=lambda m: (-_conteo(m.id), m.display_name.lower()))
+
+        def linea(m):
+            n = _conteo(m.id)
+            return f"{m.mention} · **{n}** noticia{'' if n == 1 else 's'}"
+
+    grupos = [3, 2, 1, 0]   # el grupo 4 (más alto) va primero
+    embeds = []
+    for g in grupos:
+        lineas = [f"> ## <@&{SEPARADORES_RANGO[g]}>", ""]
+        indices = [i for i in range(len(JERARQUIA)) if indice_grupo(i) == g]
+        for i in reversed(indices):          # del rango más alto al más bajo dentro del grupo
+            lineas.append(f"- <@&{JERARQUIA[i]}>")
+            miembros = por_rango[i]
+            if not miembros:
+                lineas.append("  - *Vacante*")
+            for m in miembros:
+                lineas.append(f"  - {linea(m)}")
+            lineas.append("")
+        texto = "\n".join(lineas).rstrip()
+        if g == grupos[0]:
+            texto = titulo + texto
+        embeds.append(discord.Embed(description=_recortar(texto), color=COLOR_TELEVISA))
+
+    embeds[-1].set_footer(text=f"{NOMBRE} · Actualizado", icon_url=guild.icon.url if guild.icon else None)
+    embeds[-1].timestamp = discord.utils.utcnow()
+    return embeds
+
+
+_LOCKS_PANEL = {"personal": asyncio.Lock(), "registro": asyncio.Lock()}
+_PENDIENTES_PANEL: dict = {}
+_TAREAS_PANEL: set = set()
+_ULTIMO_BOTON: dict = {}
+
+
+def _vista_panel(clave: str):
+    return PanelPersonalView() if clave == "personal" else PanelRegistroView()
+
+
+async def sincronizar_panel(clave: str) -> bool:
+    """Edita los mensajes del panel (o los vuelve a crear si alguien los borró)."""
+    async with _LOCKS_PANEL[clave]:
+        cfg = DATOS_PERSONAL["paneles"].get(clave)
+        if not cfg:
+            return False
+        canal = await _canal_por_id(cfg["canal"])
+        if canal is None:
+            print(f" No encontré el canal del panel '{clave}'.")
+            return False
+
+        embeds = _embeds_panel(clave, canal.guild)
+        ids = list(cfg.get("mensajes", []))
+        nuevos = []
+        sin_pings = discord.AllowedMentions.none()
+
+        for n, embed in enumerate(embeds):
+            vista = _vista_panel(clave) if n == len(embeds) - 1 else None   # el botón va en el último mensaje
+            mensaje = None
+            if n < len(ids):
+                try:
+                    mensaje = await canal.fetch_message(ids[n])
+                    await mensaje.edit(embed=embed, view=vista, allowed_mentions=sin_pings)
+                except discord.NotFound:
+                    mensaje = None
+                except Exception as e:
+                    print(f" Error editando el panel '{clave}': {e!r}")
+                    return False
+            if mensaje is None:
+                try:
+                    # Se usa el envío original para que NO lo convierta a tarjeta V2 (hay que poder editarlo)
+                    mensaje = await _ENVIAR_ORIGINAL(canal, embed=embed, view=vista, allowed_mentions=sin_pings)
+                except Exception as e:
+                    print(f" Error enviando el panel '{clave}': {e!r}")
+                    return False
+            nuevos.append(mensaje.id)
+
+        cfg["mensajes"] = nuevos
+        _guardar_personal()
+        return True
+
+
+def programar_actualizacion(clave: str, espera: float = 5.0):
+    """Junta varios cambios seguidos (ej. un ascenso quita y pone rol) en una sola actualización."""
+    if _PENDIENTES_PANEL.get(clave) or clave not in DATOS_PERSONAL["paneles"]:
+        return
+    _PENDIENTES_PANEL[clave] = True
+
+    async def _tarea():
+        await asyncio.sleep(espera)
+        _PENDIENTES_PANEL[clave] = False
+        try:
+            await sincronizar_panel(clave)
+        except Exception as e:
+            print(f" Error actualizando el panel '{clave}': {e!r}")
+
+    t = asyncio.create_task(_tarea())
+    _TAREAS_PANEL.add(t)
+    t.add_done_callback(_TAREAS_PANEL.discard)
+
+
+async def _borrar_panel_anterior(clave: str):
+    cfg = DATOS_PERSONAL["paneles"].get(clave)
+    if not cfg:
+        return
+    canal = await _canal_por_id(cfg["canal"])
+    if canal is None:
+        return
+    for mid in cfg.get("mensajes", []):
+        try:
+            m = await canal.fetch_message(mid)
+            await m.delete()
+        except Exception:
+            pass
+
+
+async def _boton_actualizar(interaction: discord.Interaction, clave: str):
+    ahora = time.monotonic()
+    if ahora - _ULTIMO_BOTON.get(clave, 0) < 10:
+        return await interaction.response.send_message("El panel se acaba de actualizar, espera unos segundos.", ephemeral=True)
+    _ULTIMO_BOTON[clave] = ahora
+    await interaction.response.defer(ephemeral=True)
+    ok = await sincronizar_panel(clave)
+    await interaction.followup.send("✅ Panel actualizado." if ok else "No pude actualizar el panel.", ephemeral=True)
+
+
+class PanelPersonalView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Actualizar", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="panel_personal_actualizar")
+    async def actualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _boton_actualizar(interaction, "personal")
+
+
+class PanelRegistroView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Actualizar", emoji="🔄", style=discord.ButtonStyle.secondary, custom_id="panel_registro_actualizar")
+    async def actualizar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _boton_actualizar(interaction, "registro")
+
+
+# ---------- Se actualizan solos cuando alguien sale, entra a un rango o cambia de rango ----------
+
+@bot.listen("on_member_remove")
+async def paneles_miembro_sale(member: discord.Member):
+    if member.bot:
+        return
+    programar_actualizacion("personal")
+    programar_actualizacion("registro")
+
+
+@bot.listen("on_member_update")
+async def paneles_cambio_roles(antes: discord.Member, despues: discord.Member):
+    if antes.roles == despues.roles:
+        return
+    cambiados = ({r.id for r in antes.roles} ^ {r.id for r in despues.roles}) & set(JERARQUIA)
+    if cambiados:
+        programar_actualizacion("personal")
+        programar_actualizacion("registro")
+
+
+_INICIO_PANELES = {"hecho": False}
+
+
+@bot.listen("on_ready")
+async def paneles_al_iniciar():
+    if _INICIO_PANELES["hecho"]:
+        return
+    _INICIO_PANELES["hecho"] = True
+    bot.add_view(PanelPersonalView())
+    bot.add_view(PanelRegistroView())
+    # Se refrescan al encender por si alguien entró/salió mientras el bot estaba apagado
+    programar_actualizacion("personal", 10)
+    programar_actualizacion("registro", 10)
+
+
+# ---------- Comandos de los paneles ----------
+
+@bot.tree.command(name="panel-personal", description="Publica el panel actualizable del personal por jerarquía")
+@app_commands.describe(canal="Canal donde se publica (opcional)")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_personal(interaction: discord.Interaction, canal: Optional[discord.TextChannel] = None):
+    destino = canal or (await _canal_por_id(CANAL_PANEL_PERSONAL_ID) if CANAL_PANEL_PERSONAL_ID else interaction.channel)
+    if destino is None:
+        return await interaction.response.send_message("No encontré el canal del panel.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    await _borrar_panel_anterior("personal")
+    DATOS_PERSONAL["paneles"]["personal"] = {"canal": destino.id, "mensajes": []}
+    _guardar_personal()
+    ok = await sincronizar_panel("personal")
+    await interaction.followup.send(
+        f"Panel de personal publicado en {destino.mention}." if ok else
+        "No pude publicar el panel. Revisa los permisos del bot en ese canal.", ephemeral=True)
+
+
+@bot.tree.command(name="panel-registro", description="Publica el panel actualizable con el conteo de noticias")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_registro(interaction: discord.Interaction):
+    destino = await _canal_por_id(CANAL_PANEL_REGISTRO_ID)
+    if destino is None:
+        return await interaction.response.send_message("No encontré el canal del panel de registro.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+    await _borrar_panel_anterior("registro")
+    DATOS_PERSONAL["paneles"]["registro"] = {"canal": destino.id, "mensajes": []}
+    _guardar_personal()
+    ok = await sincronizar_panel("registro")
+    await interaction.followup.send(
+        f"Panel de registro publicado en {destino.mention}." if ok else
+        "No pude publicar el panel. Revisa los permisos del bot en ese canal.", ephemeral=True)
+
+
+# ---------- /registro ----------
+
+@bot.tree.command(name="registro", description="Registra una noticia publicada")
+@app_commands.describe(
+    link_noticia="Link de la noticia",
+    link_noticia_mxrp="Link de la noticia en MXRP",
+    trabajador="Trabajador (opcional, por defecto eres tú)",
+)
+@app_commands.guild_only()
+async def registro(
+    interaction: discord.Interaction,
+    link_noticia: app_commands.Range[str, 8, 500],
+    link_noticia_mxrp: app_commands.Range[str, 8, 500],
+    trabajador: Optional[discord.Member] = None,
+):
+    autor = interaction.user
+    trabajador = trabajador or autor
+
+    if trabajador.bot:
+        return await interaction.response.send_message("No puedes registrar noticias a un bot.", ephemeral=True)
+    if trabajador != autor and not autor.guild_permissions.manage_roles:
+        return await interaction.response.send_message("Solo un directivo puede registrar noticias de otra persona.", ephemeral=True)
+    if obtener_rango_actual(trabajador) < 0:
+        return await interaction.response.send_message(f"{trabajador.mention} no es trabajador de {NOMBRE}.", ephemeral=True)
+
+    link_noticia = link_noticia.strip()
+    link_noticia_mxrp = link_noticia_mxrp.strip()
+    for link in (link_noticia, link_noticia_mxrp):
+        if not link.lower().startswith(("http://", "https://")):
+            return await interaction.response.send_message("Los links deben empezar con http:// o https://", ephemeral=True)
+
+    canal = await _canal_por_id(CANAL_REGISTRO_NOTICIAS_ID)
+    if canal is None:
+        return await interaction.response.send_message("No encontré el canal de registros.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    nuevo = _conteo(trabajador.id) + 1
+
+    embed = discord.Embed(
+        description=(
+            f"# REGISTRO DE NOTICIAS\n"
+            f">**Trabajador**\n"
+            f"> {trabajador.mention}\n"
+            f">\n"
+            f">**Conteo de Noticias**\n"
+            f"> {nuevo}\n"
+            f">\n"
+            f">**Link de Noticia**\n"
+            f"> {link_noticia}\n"
+            f">\n"
+            f"> **Link de Noticia MXRP**\n"
+            f"> {link_noticia_mxrp}"
+        ),
+        color=COLOR_TELEVISA,
+    )
+    embed.set_thumbnail(url=trabajador.display_avatar.url)
+    embed.set_footer(text=NOMBRE, icon_url=interaction.guild.icon.url if interaction.guild.icon else None)
+
+    try:
+        # El ping al rol va FUERA del embed
+        mensaje = await canal.send(
+            content=f"<@&{ROL_PING_REGISTRO_ID}>",
+            embed=embed,
+            allowed_mentions=discord.AllowedMentions(roles=[discord.Object(id=ROL_PING_REGISTRO_ID)], users=False),
+        )
+    except Exception as e:
+        print(f" Error enviando el registro de noticia: {e!r}")
+        return await interaction.followup.send(f"No pude enviar el registro. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    DATOS_PERSONAL["conteos"][str(trabajador.id)] = nuevo
+    _guardar_personal()
+    programar_actualizacion("registro", 2)
+
+    await interaction.followup.send(
+        f"Noticia registrada ({nuevo} en total para {trabajador.mention}): {mensaje.jump_url}",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="conteo-noticias", description="Corrige manualmente el conteo de noticias de un trabajador")
+@app_commands.describe(usuario="Trabajador", cantidad="Cantidad total de noticias")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def conteo_noticias(interaction: discord.Interaction, usuario: discord.Member, cantidad: app_commands.Range[int, 0, 100000]):
+    DATOS_PERSONAL["conteos"][str(usuario.id)] = cantidad
+    _guardar_personal()
+    programar_actualizacion("registro", 2)
+    await interaction.response.send_message(
+        f"Conteo de {usuario.mention} fijado en **{cantidad}**.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---------- /pagos ----------
+
+@bot.tree.command(name="pagos", description="Registra un pago a un trabajador con fotos de prueba")
+@app_commands.describe(
+    trabajador="Trabajador al que se le paga",
+    monto="Monto pagado (ej. $50,000)",
+    prueba="Foto de prueba del pago",
+    prueba_2="Segunda foto de prueba (opcional)",
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.guild_only()
+async def pagos(
+    interaction: discord.Interaction,
+    trabajador: discord.Member,
+    monto: app_commands.Range[str, 1, 50],
+    prueba: discord.Attachment,
+    prueba_2: Optional[discord.Attachment] = None,
+):
+    guild = interaction.guild
+    autor = interaction.user
+
+    if trabajador.bot:
+        return await interaction.response.send_message("No puedes pagarle a un bot.", ephemeral=True)
+
+    pruebas = [p for p in (prueba, prueba_2) if p is not None]
+    for p in pruebas:
+        if not es_imagen(p):
+            return await interaction.response.send_message("Las pruebas deben ser imágenes.", ephemeral=True)
+        if p.size > guild.filesize_limit:
+            return await interaction.response.send_message("Una imagen pesa más de lo que permite este servidor.", ephemeral=True)
+
+    canal = (await _canal_por_id(CANAL_PAGOS_ID)) if CANAL_PAGOS_ID else interaction.channel
+    if canal is None:
+        return await interaction.response.send_message("No encontré el canal de pagos.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        archivos = [
+            await p.to_file(filename=f"pago_{i}{extension_archivo(p)}")
+            for i, p in enumerate(pruebas, start=1)
+        ]
+
+        contenedor = discord.ui.Container(accent_colour=COLOR_TELEVISA)
+        contenedor.add_item(discord.ui.Section(
+            discord.ui.TextDisplay(
+                f"# PAGO\n"
+                f"**Trabajador:** {trabajador.mention}\n"
+                f"**Monto:** {monto}\n"
+                f"**Pagado por:** {autor.mention}\n"
+                f"**Fecha:** {datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y')}"
+            ),
+            accessory=discord.ui.Thumbnail(trabajador.display_avatar.url),
+        ))
+        contenedor.add_item(discord.ui.Separator())
+        contenedor.add_item(discord.ui.TextDisplay("**Pruebas:**"))
+        galeria = discord.ui.MediaGallery()
+        for a in archivos:
+            galeria.add_item(media=f"attachment://{a.filename}")
+        contenedor.add_item(galeria)
+        contenedor.add_item(discord.ui.Separator())
+        contenedor.add_item(discord.ui.TextDisplay(f"-# {NOMBRE}"))
+
+        vista = discord.ui.LayoutView(timeout=None)
+        vista.add_item(discord.ui.TextDisplay(trabajador.mention))   # ping al trabajador arriba de la tarjeta
+        vista.add_item(contenedor)
+
+        mensaje = await canal.send(
+            view=vista,
+            files=archivos,
+            allowed_mentions=discord.AllowedMentions(users=[trabajador], roles=False),
+        )
+    except Exception as e:
+        print(f" Error enviando el pago: {e!r}")
+        return await interaction.followup.send(f"No pude enviar el pago. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    await interaction.followup.send(f"Pago registrado: {mensaje.jump_url}", ephemeral=True)
 # INICIAR BOT
 
 if not TOKEN:
