@@ -3488,16 +3488,16 @@ async def registro(
     embed = discord.Embed(
         description=(
             f"# REGISTRO DE NOTICIAS\n"
-            f">**Trabajador**\n"
+            f"> **Trabajador:**\n"
             f"> {trabajador.mention}\n"
-            f">\n"
-            f">**Conteo de Noticias**\n"
+            f"> \n"
+            f"> **Conteo de Noticias:**\n"
             f"> {nuevo}\n"
-            f">\n"
-            f">**Link de Noticia**\n"
+            f"> \n"
+            f"> **Link de Noticia:**\n"
             f"> {link_noticia}\n"
-            f">\n"
-            f"> **Link de Noticia MXRP**\n"
+            f"> \n"
+            f"> **Link de Noticia MXRP:**\n"
             f"> {link_noticia_mxrp}"
         ),
         color=COLOR_TELEVISA,
