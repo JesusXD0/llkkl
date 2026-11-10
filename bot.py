@@ -1,7 +1,10 @@
+import asyncio
 import json
 import os
 import re
 import secrets
+import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -637,12 +640,23 @@ async def noticia(interaction: discord.Interaction):
 #  - Cada cambio se guarda solo: puedes cerrar el editor y al volver a usar /embed carga lo último que tenías.
 #  - Cada persona tiene su propio borrador.
 #  - El pie de la tarjeta SIEMPRE lleva el nombre del grupo.
-#  - Los borradores se guardan en un archivo JSON. En Railway el disco se borra en cada deploy: si quieres que
-#    sobrevivan, crea un Volume y pon la variable DATA_DIR con su ruta (ejemplo: /data).
+#  - Los borradores, los conteos de noticias y los paneles se guardan en archivos JSON dentro de CARPETA_DATOS.
+#    En Railway el disco se borra en cada deploy: crea un Volume (mount path /data) y el bot lo usa solo
+#    (lee DATA_DIR o RAILWAY_VOLUME_MOUNT_PATH).
 
-CARPETA_DATOS = os.getenv("DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+CARPETA_DATOS = (
+    os.getenv("DATA_DIR")
+    or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    or os.path.dirname(os.path.abspath(__file__))
+)
 RUTA_BORRADORES = os.path.join(CARPETA_DATOS, "embeds_borradores.json")
 CARPETA_IMAGENES_EMBED = os.path.join(CARPETA_DATOS, "embed_imagenes")
+
+# Aviso si estás en Railway pero sin Volume (los datos se perderían en cada deploy)
+if os.getenv("RAILWAY_ENVIRONMENT") and not (os.getenv("DATA_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH")):
+    print(" ⚠️ Estás en Railway SIN Volume: los conteos y borradores se perderán al reiniciar. Crea un Volume.")
+else:
+    print(f" Datos guardados en: {CARPETA_DATOS}")
 
 MAX_PINGS_EMBED = 10
 
@@ -1675,15 +1689,7 @@ async def crear_embed(
             "Selecciona un canal de texto o un foro.",
             ephemeral=True
         )
-import uuid
 
-# =====================================================================================================================
-# PEGA TODO ESTO en el bot.py de Televisa, justo ANTES de la línea "# INICIAR BOT" (al final del archivo).
-# No necesita cambiar nada más: registra sus propios botones al iniciar.
-# Antes de usarlo rellena los IDs de la sección CONFIGURACION DEL RECLUTAMIENTO (los que están en 0).
-# =====================================================================================================================
-
-import uuid
 
 # RECLUTAMIENTO CON FORMULARIO POR DM (tipo Appy) ---------------------------------------------------------------------
 #
@@ -2412,6 +2418,8 @@ async def reclutamiento_al_iniciar():
     _INICIO_RECLUTAMIENTO["hecho"] = True
     bot.add_view(PanelReclutamientoView())
     bot.add_view(SolicitudReclutamientoView())
+
+
 # PANEL DE NOTICIAS (roles por botón) ---------------------------------------------------------------------------------
 # /panel-noticias publica un panel donde cada quien se pone o se quita, con un click, el rol del tipo de noticia que
 # quiere recibir (esos roles son los que se mencionan cuando se publica una noticia).
@@ -2667,8 +2675,6 @@ async def despedir(
         f"{usuario.mention} fue despedido ({len(retirados)} rol(es) retirados).",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-
-import asyncio
 
 # TICKETS -------------------------------------------------------------------------------------------------------------
 # /panel-tickets pone el botón "🎫 Abrir Ticket" en un mensaje del bot (el ID de tu embed) o publica un panel nuevo.
@@ -3132,19 +3138,6 @@ async def _enviar_con_v2(self, *args, **kwargs):
 
 discord.abc.Messageable.send = _enviar_con_v2
 
-import time
-
-# =====================================================================================================================
-# PEGA TODO ESTO en bot.py, justo ANTES de la línea "# INICIAR BOT" (después del bloque de TARJETAS V2 AUTOMATICAS).
-# No necesita nada más: registra sus propios botones y eventos al iniciar.
-#
-# Comandos nuevos:
-#   /panel-personal   (admin)  publica el panel de personal por jerarquía
-#   /panel-registro   (admin)  publica el panel de conteo de noticias en el canal 1554334830018433055
-#   /registro                  registra una noticia (el aviso sale en el canal 1554338479956037633)
-#   /conteo-noticias  (admin)  corrige manualmente el conteo de alguien
-#   /pagos                     registra un pago con fotos de prueba y menciona al trabajador
-# =====================================================================================================================
 
 # PANELES DE PERSONAL / REGISTRO DE NOTICIAS / PAGOS ------------------------------------------------------------------
 
@@ -3212,12 +3205,12 @@ def _recortar(texto: str, limite: int = MAX_DESC_PANEL) -> str:
 
 
 def _embeds_panel(clave: str, guild: discord.Guild) -> list:
-    """Un embed por grupo (de EJECUTIVOS hacia abajo). Cada uno es un mensaje, así no se pasa del límite."""
+    """Un solo embed por panel, con todos los grupos adentro (de mayor a menor rango)."""
     por_rango = _trabajadores_por_rango(guild)
     total = sum(len(v) for v in por_rango.values())
 
     if clave == "personal":
-        titulo = f"# 👥 PERSONAL DE {NOMBRE.upper()}\n-# {total} trabajadores en total\n\n"
+        titulo = f"# 👥 PERSONAL DE {NOMBRE.upper()}\n-# {total} trabajadores en total"
         for v in por_rango.values():
             v.sort(key=lambda m: m.display_name.lower())
 
@@ -3225,7 +3218,7 @@ def _embeds_panel(clave: str, guild: discord.Guild) -> list:
             return m.mention
     else:
         total_n = sum(_conteo(m.id) for v in por_rango.values() for m in v)
-        titulo = f"# 📰 REGISTRO DE NOTICIAS\n-# {total} trabajadores · {total_n} noticias en total\n\n"
+        titulo = f"# 📰 REGISTRO DE NOTICIAS\n-# {total} trabajadores · {total_n} noticias en total"
         for v in por_rango.values():
             v.sort(key=lambda m: (-_conteo(m.id), m.display_name.lower()))
 
@@ -3233,9 +3226,8 @@ def _embeds_panel(clave: str, guild: discord.Guild) -> list:
             n = _conteo(m.id)
             return f"{m.mention} · **{n}** noticia{'' if n == 1 else 's'}"
 
-    grupos = [3, 2, 1, 0]   # el grupo 4 (más alto) va primero
-    embeds = []
-    for g in grupos:
+    bloques = [titulo]
+    for g in [3, 2, 1, 0]:   # el grupo 4 (más alto) va primero
         lineas = [f"> ## <@&{SEPARADORES_RANGO[g]}>", ""]
         indices = [i for i in range(len(JERARQUIA)) if indice_grupo(i) == g]
         for i in reversed(indices):          # del rango más alto al más bajo dentro del grupo
@@ -3246,14 +3238,12 @@ def _embeds_panel(clave: str, guild: discord.Guild) -> list:
             for m in miembros:
                 lineas.append(f"  - {linea(m)}")
             lineas.append("")
-        texto = "\n".join(lineas).rstrip()
-        if g == grupos[0]:
-            texto = titulo + texto
-        embeds.append(discord.Embed(description=_recortar(texto), color=COLOR_TELEVISA))
+        bloques.append("\n".join(lineas).rstrip())
 
-    embeds[-1].set_footer(text=f"{NOMBRE} · Actualizado", icon_url=guild.icon.url if guild.icon else None)
-    embeds[-1].timestamp = discord.utils.utcnow()
-    return embeds
+    embed = discord.Embed(description=_recortar("\n\n".join(bloques)), color=COLOR_TELEVISA)
+    embed.set_footer(text=f"{NOMBRE} · Actualizado", icon_url=guild.icon.url if guild.icon else None)
+    embed.timestamp = discord.utils.utcnow()
+    return [embed]
 
 
 _LOCKS_PANEL = {"personal": asyncio.Lock(), "registro": asyncio.Lock()}
@@ -3267,7 +3257,7 @@ def _vista_panel(clave: str):
 
 
 async def sincronizar_panel(clave: str) -> bool:
-    """Edita los mensajes del panel (o los vuelve a crear si alguien los borró)."""
+    """Edita el mensaje del panel (o lo vuelve a crear si alguien lo borró)."""
     async with _LOCKS_PANEL[clave]:
         cfg = DATOS_PERSONAL["paneles"].get(clave)
         if not cfg:
@@ -3302,6 +3292,14 @@ async def sincronizar_panel(clave: str) -> bool:
                     print(f" Error enviando el panel '{clave}': {e!r}")
                     return False
             nuevos.append(mensaje.id)
+
+        # Borra los mensajes viejos que ya no hacen falta (antes eran varios por panel)
+        for mid in ids[len(embeds):]:
+            try:
+                sobrante = await canal.fetch_message(mid)
+                await sobrante.delete()
+            except Exception:
+                pass
 
         cfg["mensajes"] = nuevos
         _guardar_personal()
@@ -3516,6 +3514,7 @@ async def registro(
         print(f" Error enviando el registro de noticia: {e!r}")
         return await interaction.followup.send(f"No pude enviar el registro. Error: `{type(e).__name__}: {e}`", ephemeral=True)
 
+    # Se guarda en el JSON (que vive en el Volume de Railway) y el registro queda también publicado en el canal
     DATOS_PERSONAL["conteos"][str(trabajador.id)] = nuevo
     _guardar_personal()
     programar_actualizacion("registro", 2)
@@ -3536,6 +3535,62 @@ async def conteo_noticias(interaction: discord.Interaction, usuario: discord.Mem
     await interaction.response.send_message(
         f"Conteo de {usuario.mention} fijado en **{cantidad}**.",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+# ---------- /reconstruir-conteo (red de seguridad si se pierde el JSON) ----------
+
+def _texto_de_componentes(componentes) -> str:
+    partes = []
+    for c in componentes or []:
+        contenido = getattr(c, "content", None)
+        if isinstance(contenido, str):
+            partes.append(contenido)
+        hijos = getattr(c, "children", None)
+        if hijos:
+            partes.append(_texto_de_componentes(hijos))
+    return "\n".join(partes)
+
+
+@bot.tree.command(name="reconstruir-conteo", description="Recupera el conteo de noticias leyendo el historial del canal de registros")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def reconstruir_conteo(interaction: discord.Interaction):
+    canal = await _canal_por_id(CANAL_REGISTRO_NOTICIAS_ID)
+    if canal is None:
+        return await interaction.response.send_message("No encontré el canal de registros.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    patron = re.compile(
+        r"Trabajador:\*\*\s*(?:>\s*)?<@!?(\d+)>\s*(?:>\s*)*\*\*Conteo de Noticias:\*\*\s*(?:>\s*)?(\d+)"
+    )
+    maximos: dict = {}
+    leidos = 0
+
+    try:
+        async for m in canal.history(limit=None):
+            if m.author.id != bot.user.id:
+                continue
+            texto = _texto_de_componentes(m.components)
+            for e in m.embeds:
+                texto += "\n" + (e.description or "")
+            for uid, n in patron.findall(texto):
+                leidos += 1
+                maximos[uid] = max(maximos.get(uid, 0), int(n))
+    except Exception as e:
+        print(f" Error leyendo el historial de registros: {e!r}")
+        return await interaction.followup.send(f"No pude leer el canal. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    if not maximos:
+        return await interaction.followup.send("No encontré registros en el canal.", ephemeral=True)
+
+    DATOS_PERSONAL["conteos"].update(maximos)
+    _guardar_personal()
+    programar_actualizacion("registro", 2)
+
+    await interaction.followup.send(
+        f"Conteo reconstruido: **{len(maximos)}** trabajadores ({leidos} registros leídos).",
+        ephemeral=True)
 
 
 # ---------- /pagos ----------
@@ -3615,6 +3670,8 @@ async def pagos(
         return await interaction.followup.send(f"No pude enviar el pago. Error: `{type(e).__name__}: {e}`", ephemeral=True)
 
     await interaction.followup.send(f"Pago registrado: {mensaje.jump_url}", ephemeral=True)
+
+
 # INICIAR BOT
 
 if not TOKEN:
