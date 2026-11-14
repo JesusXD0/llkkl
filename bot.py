@@ -3694,6 +3694,224 @@ async def pagos(
     await interaction.followup.send(f"Pago registrado: {mensaje.jump_url}", ephemeral=True)
 
 
+# CLIENTES ------------------------------------------------------------------------------------------------------------
+# /cliente asigna siempre el separador de clientes + el rol del nivel + su rol de descuento, y publica una tarjeta
+# pública en el canal donde se usa. /descuento-dar y /descuento-quitar manejan descuentos voluntarios (sin nivel).
+
+ROL_SEPARADOR_CLIENTES = 1571020877837897848
+COLOR_CLIENTES = discord.Color.from_rgb(30, 91, 216)      # azul brillante #1e5bd8 (cámbialo si lo quieres más oscuro)
+
+NIVELES_CLIENTE = {
+    1: {"nombre": "Cliente",            "rol": 1554546103301439588, "descuento": 10, "rol_descuento": 1571022087970226226},
+    2: {"nombre": "Cliente Frecuente",   "rol": 1571021032880349204, "descuento": 30, "rol_descuento": 1571021953727340604},
+    3: {"nombre": "Cliente Destacado",   "rol": 1571021879995666502, "descuento": 50, "rol_descuento": 1571022023852032071},
+}
+
+# Porcentaje -> rol de descuento (los mismos de los niveles; sirven también para los descuentos voluntarios)
+ROLES_DESCUENTO = {c["descuento"]: c["rol_descuento"] for c in NIVELES_CLIENTE.values()}
+
+
+def tarjeta_cliente(comprador: discord.Member, texto: str) -> discord.ui.LayoutView:
+    """Tarjeta azul: ping al comprador arriba, texto a la izquierda y su foto de perfil arriba a la derecha."""
+    contenedor = discord.ui.Container(accent_colour=COLOR_CLIENTES)
+    contenedor.add_item(discord.ui.Section(
+        discord.ui.TextDisplay(f"## 🤝 CLIENTES - {NOMBRE.upper()}\n{texto}"),
+        accessory=discord.ui.Thumbnail(comprador.display_avatar.url),
+    ))
+    contenedor.add_item(discord.ui.Separator())
+    contenedor.add_item(discord.ui.TextDisplay(
+        f"-# {NOMBRE} · {datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y')}"
+    ))
+
+    vista = discord.ui.LayoutView(timeout=None)
+    vista.add_item(discord.ui.TextDisplay(comprador.mention))   # el ping al comprador va arriba de la tarjeta
+    vista.add_item(contenedor)
+    return vista
+
+
+async def publicar_tarjeta_cliente(interaction: discord.Interaction, comprador: discord.Member, texto: str):
+    return await interaction.channel.send(
+        view=tarjeta_cliente(comprador, texto),
+        allowed_mentions=discord.AllowedMentions(users=[comprador], roles=False),
+    )
+
+
+@bot.tree.command(name="cliente", description="Registra a un comprador como cliente y le asigna su nivel y descuento")
+@app_commands.describe(comprador="Usuario que realizó la compra", nivel="Nivel de cliente que se le asigna")
+@app_commands.choices(nivel=[
+    app_commands.Choice(name="Nivel 1 · Cliente (10% de descuento)", value=1),
+    app_commands.Choice(name="Nivel 2 · Cliente Frecuente (30% de descuento)", value=2),
+    app_commands.Choice(name="Nivel 3 · Cliente Destacado (50% de descuento)", value=3),
+])
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.guild_only()
+async def cliente(interaction: discord.Interaction, comprador: discord.Member, nivel: app_commands.Choice[int]):
+    guild = interaction.guild
+    cfg = NIVELES_CLIENTE[nivel.value]
+
+    if comprador.bot:
+        return await interaction.response.send_message("No puedes asignar un nivel de cliente a un bot.", ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message("No pude determinar el canal donde publicar.", ephemeral=True)
+
+    separador = guild.get_role(ROL_SEPARADOR_CLIENTES)
+    rol_nivel = guild.get_role(cfg["rol"])
+    rol_descuento = guild.get_role(cfg["rol_descuento"])
+    if separador is None or rol_nivel is None or rol_descuento is None:
+        return await interaction.response.send_message(
+            "No encontré uno de los roles de clientes en el servidor. Revisa los IDs.", ephemeral=True)
+
+    nuevos = [separador, rol_nivel, rol_descuento]
+    error = error_jerarquia(guild, comprador, nuevos, interaction.user)
+    if error:
+        return await interaction.response.send_message(error, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Roles de los otros niveles (nivel y descuento) que hay que quitar al cambiar de nivel
+    ids_nuevos = {r.id for r in nuevos}
+    otros = []
+    for n, c in NIVELES_CLIENTE.items():
+        if n == nivel.value:
+            continue
+        for rol_id in (c["rol"], c["rol_descuento"]):
+            r = guild.get_role(rol_id)
+            if r is not None and r in comprador.roles and r.id not in ids_nuevos:
+                otros.append(r)
+
+    try:
+        por_agregar = [r for r in nuevos if r not in comprador.roles]
+        if por_agregar:
+            await comprador.add_roles(*por_agregar, reason=f"Cliente nivel {nivel.value} por {interaction.user}")
+        if otros:
+            await comprador.remove_roles(*otros, reason=f"Cambio de nivel de cliente por {interaction.user}")
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "No pude asignar los roles. Revisa que el bot tenga **Gestionar roles** y esté por encima de ellos.",
+            ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"Discord no me dejó asignar los roles: `{e}`", ephemeral=True)
+
+    texto = (
+        f"{comprador.mention} Ahora eres {rol_nivel.mention}\n\n"
+        f"Gracias a eso ahora obtienes un {rol_descuento.mention} el cual puedes usar en tu siguiente compra."
+    )
+    try:
+        mensaje = await publicar_tarjeta_cliente(interaction, comprador, texto)
+    except Exception as e:
+        print(f" Error enviando la tarjeta de cliente: {e!r}")
+        return await interaction.followup.send(
+            f"Los roles se asignaron, pero no pude publicar la tarjeta: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    await interaction.followup.send(f"Cliente registrado: {mensaje.jump_url}", ephemeral=True)
+
+
+# ---------- Descuentos voluntarios ----------
+
+OPCIONES_DESCUENTO = [
+    app_commands.Choice(name="10%", value=10),
+    app_commands.Choice(name="30%", value=30),
+    app_commands.Choice(name="50%", value=50),
+]
+
+
+@bot.tree.command(name="descuento-dar", description="Otorga un descuento voluntario a un usuario (sin depender de su nivel)")
+@app_commands.describe(
+    usuario="Usuario que recibe el descuento",
+    porcentaje="Porcentaje de descuento",
+    motivo="Motivo del descuento (opcional, se muestra en la tarjeta)",
+)
+@app_commands.choices(porcentaje=OPCIONES_DESCUENTO)
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.guild_only()
+async def descuento_dar(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    porcentaje: app_commands.Choice[int],
+    motivo: Optional[app_commands.Range[str, 1, 200]] = None,
+):
+    guild = interaction.guild
+
+    if usuario.bot:
+        return await interaction.response.send_message("No puedes darle un descuento a un bot.", ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message("No pude determinar el canal donde publicar.", ephemeral=True)
+
+    rol = guild.get_role(ROLES_DESCUENTO[porcentaje.value])
+    if rol is None:
+        return await interaction.response.send_message("No encontré el rol de ese descuento en el servidor.", ephemeral=True)
+    if rol in usuario.roles:
+        return await interaction.response.send_message(f"{usuario.mention} ya tiene el descuento {rol.mention}.", ephemeral=True)
+
+    error = error_jerarquia(guild, usuario, [rol], interaction.user)
+    if error:
+        return await interaction.response.send_message(error, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await usuario.add_roles(rol, reason=f"Descuento voluntario por {interaction.user}")
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "No pude asignar el rol. Revisa que el bot tenga **Gestionar roles** y esté por encima de él.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"Discord no me dejó asignar el rol: `{e}`", ephemeral=True)
+
+    texto = (
+        f"{usuario.mention} Se te ha otorgado un {rol.mention}\n\n"
+        f"Puedes usarlo en tu siguiente compra."
+    )
+    if motivo:
+        texto += f"\n\n**Motivo:** {motivo}"
+
+    try:
+        mensaje = await publicar_tarjeta_cliente(interaction, usuario, texto)
+    except Exception as e:
+        print(f" Error enviando la tarjeta de descuento: {e!r}")
+        return await interaction.followup.send(
+            f"El descuento se asignó, pero no pude publicar la tarjeta: `{type(e).__name__}: {e}`", ephemeral=True)
+
+    await interaction.followup.send(f"Descuento otorgado: {mensaje.jump_url}", ephemeral=True)
+
+
+@bot.tree.command(name="descuento-quitar", description="Quita un descuento a un usuario (si no eliges porcentaje, quita todos)")
+@app_commands.describe(
+    usuario="Usuario al que se le quita el descuento",
+    porcentaje="Descuento a quitar (opcional: si lo dejas vacío se quitan todos los que tenga)",
+)
+@app_commands.choices(porcentaje=OPCIONES_DESCUENTO)
+@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.guild_only()
+async def descuento_quitar(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    porcentaje: Optional[app_commands.Choice[int]] = None,
+):
+    guild = interaction.guild
+
+    ids = [ROLES_DESCUENTO[porcentaje.value]] if porcentaje else list(ROLES_DESCUENTO.values())
+    roles = [r for r in (guild.get_role(i) for i in ids) if r is not None and r in usuario.roles]
+    if not roles:
+        return await interaction.response.send_message(f"{usuario.mention} no tiene ese descuento.", ephemeral=True)
+
+    error = error_jerarquia(guild, usuario, roles, interaction.user)
+    if error:
+        return await interaction.response.send_message(error, ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        await usuario.remove_roles(*roles, reason=f"Descuento retirado por {interaction.user}")
+    except discord.Forbidden:
+        return await interaction.followup.send(
+            "No pude quitar el rol. Revisa que el bot tenga **Gestionar roles** y esté por encima de él.", ephemeral=True)
+    except discord.HTTPException as e:
+        return await interaction.followup.send(f"Discord no me dejó quitar el rol: `{e}`", ephemeral=True)
+
+    lista = ", ".join(r.mention for r in roles)
+    await interaction.followup.send(f"Descuento retirado a {usuario.mention}: {lista}", ephemeral=True)
+
+
 # INICIAR BOT
 
 if not TOKEN:
