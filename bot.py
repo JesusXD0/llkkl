@@ -121,7 +121,7 @@ async def on_ready():
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
-    if isinstance(error, app_commands.MissingPermissions):
+    if isinstance(error, (app_commands.MissingPermissions, app_commands.CheckFailure)):
         texto = "No tienes permiso para usar este comando."
     else:
         print(f" Error en un comando: {error!r}")
@@ -2452,12 +2452,10 @@ CANAL_PANEL_NOTICIAS_ID = 1568373659775541378
 def embed_panel_noticias(guild: discord.Guild, con_imagen: bool) -> discord.Embed:
     bloques = []
     for cfg in TIPOS_NOTICIA.values():
-        rol = guild.get_role(cfg["rol"])
-        suscritos = len(rol.members) if rol else 0
         bloques.append(
             f"{cfg['emoji']} **{cfg['panel']}**\n"
             f"> {cfg['desc']}\n"
-            f"> <@&{cfg['rol']}> · 👥 **{suscritos}** suscritos"
+            f"> <@&{cfg['rol']}>"
         )
 
     embed = discord.Embed(
@@ -2475,37 +2473,56 @@ def embed_panel_noticias(guild: discord.Guild, con_imagen: bool) -> discord.Embe
     return embed
 
 
+# Separador "Seguidor": se da al tener cualquier rol de noticias y se quita al quedarse sin ninguno
+ROL_SEGUIDOR_ID = 1568384431830597633
+
+
 async def alternar_rol_noticias(interaction: discord.Interaction, clave: str):
     cfg = TIPOS_NOTICIA[clave]
     guild = interaction.guild
     miembro = interaction.user
     rol = guild.get_role(cfg["rol"])
+    separador = guild.get_role(ROL_SEGUIDOR_ID)
 
     if rol is None:
         return await interaction.response.send_message("No encontré ese rol en el servidor.", ephemeral=True)
     if rol >= guild.me.top_role:
         return await interaction.response.send_message(
             "No puedo gestionar ese rol: está por encima o igual a mi rol más alto.", ephemeral=True)
+    if separador is not None and separador >= guild.me.top_role:
+        print(" El separador de Seguidor está por encima o igual al rol del bot: no se puede asignar.")
+        separador = None
 
+    # Se calcula con los roles que tenía al pulsar (la interacción trae una copia que no se actualiza sola)
+    ids_antes = {r.id for r in miembro.roles}
+    tenia = rol.id in ids_antes
+    ids_noticias = {c["rol"] for c in TIPOS_NOTICIA.values()}
+    ids_despues = (ids_antes - {rol.id}) if tenia else (ids_antes | {rol.id})
+    tendra_noticias = bool(ids_despues & ids_noticias)
+
+    agregar, quitar = [], []
+    (quitar if tenia else agregar).append(rol)
+    if separador is not None:
+        if tendra_noticias and separador.id not in ids_antes:
+            agregar.append(separador)
+        elif not tendra_noticias and separador.id in ids_antes:
+            quitar.append(separador)
+
+    await interaction.response.defer(ephemeral=True)
     try:
-        if rol in miembro.roles:
-            await miembro.remove_roles(rol, reason="Panel de noticias")
-            texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
-        else:
-            await miembro.add_roles(rol, reason="Panel de noticias")
-            texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+        if agregar:
+            await miembro.add_roles(*agregar, reason="Panel de noticias")
+        if quitar:
+            await miembro.remove_roles(*quitar, reason="Panel de noticias")
     except discord.Forbidden:
-        return await interaction.response.send_message(
-            "No pude cambiar tu rol. Avisa a un directivo.", ephemeral=True)
+        return await interaction.followup.send("No pude cambiar tu rol. Avisa a un directivo.", ephemeral=True)
 
-    await interaction.response.send_message(texto, ephemeral=True)
-
-    # Actualiza el contador de suscritos del panel
-    try:
-        con_imagen = any(a.filename == "fondo.png" for a in interaction.message.attachments)
-        await interaction.message.edit(embed=embed_panel_noticias(guild, con_imagen), view=PanelNoticiasView())
-    except Exception as e:
-        print(f" No pude actualizar el contador del panel de noticias: {e!r}")
+    if tenia:
+        texto = f"❎ Ya no recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+    else:
+        texto = f"✅ Listo, ahora recibirás avisos de {cfg['emoji']} **{cfg['panel']}**."
+    await interaction.followup.send(texto, ephemeral=True)
+    # El mensaje del panel ya NO se edita al pulsar un botón: editarlo era lo que movía la foto.
 
 
 class PanelNoticiasView(discord.ui.View):
@@ -2548,6 +2565,38 @@ async def panel_noticias(interaction: discord.Interaction):
         return await interaction.followup.send(f"No pude publicar el panel. Error: `{type(e).__name__}: {e}`", ephemeral=True)
 
     await interaction.followup.send(f"Panel de noticias publicado en {canal.mention}.", ephemeral=True)
+
+
+@bot.tree.command(name="sincronizar-seguidores", description="Da el separador de Seguidor a quienes ya tienen un rol de noticias")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def sincronizar_seguidores(interaction: discord.Interaction):
+    guild = interaction.guild
+    separador = guild.get_role(ROL_SEGUIDOR_ID)
+    if separador is None:
+        return await interaction.response.send_message("No encontré el rol de Seguidor en el servidor.", ephemeral=True)
+    if separador >= guild.me.top_role:
+        return await interaction.response.send_message(
+            "No puedo asignar el rol de Seguidor: está por encima o igual a mi rol más alto.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    ids_noticias = {c["rol"] for c in TIPOS_NOTICIA.values()}
+    pendientes = [
+        m for m in guild.members
+        if not m.bot and separador not in m.roles and any(r.id in ids_noticias for r in m.roles)
+    ]
+    listos = fallos = 0
+    for m in pendientes:
+        try:
+            await m.add_roles(separador, reason="Sincronizar separador de Seguidor")
+            listos += 1
+        except Exception:
+            fallos += 1
+
+    await interaction.followup.send(
+        f"Separador de Seguidor asignado a **{listos}** usuario(s)."
+        + (f" No pude con **{fallos}**." if fallos else ""), ephemeral=True)
 
 
 _INICIO_NOTICIAS = {"hecho": False}
@@ -3694,9 +3743,12 @@ async def pagos(
     await interaction.followup.send(f"Pago registrado: {mensaje.jump_url}", ephemeral=True)
 
 
-# CLIENTES ------------------------------------------------------------------------------------------------------------
-# /cliente asigna siempre el separador de clientes + el rol del nivel + su rol de descuento, y publica una tarjeta
-# pública en el canal donde se usa. /descuento-dar y /descuento-quitar manejan descuentos voluntarios (sin nivel).
+# CLIENTES, VENTAS, TOP Y TICKETS DE COMPRA ---------------------------------------------------------------------------
+# /cliente        -> registra al comprador (separador + nivel + descuento) y publica una tarjeta pública.
+# /descuento-*    -> descuentos voluntarios (sin depender del nivel).
+# /venta          -> registra una venta con el precio del catálogo (se guarda en ventas.json, dentro de CARPETA_DATOS).
+# /top servicios  -> top de compradores y vendedores (con botón para cambiar) o el perfil de un usuario.
+# /panel-ventas   -> botón "Abrir ticket para comprar"; los tickets van a su propia categoría y todo llega al log.
 
 ROL_SEPARADOR_CLIENTES = 1571020877837897848
 COLOR_CLIENTES = discord.Color.from_rgb(30, 91, 216)      # azul brillante #1e5bd8 (cámbialo si lo quieres más oscuro)
@@ -3710,23 +3762,114 @@ NIVELES_CLIENTE = {
 # Porcentaje -> rol de descuento (los mismos de los niveles; sirven también para los descuentos voluntarios)
 ROLES_DESCUENTO = {c["descuento"]: c["rol_descuento"] for c in NIVELES_CLIENTE.values()}
 
+CATEGORIA_VENTAS_ID = 1571247851189702749     # Categoría donde se crean los tickets de compra
+CANAL_LOGS_VENTAS_ID = 1568144615830196274    # Log de ventas, clientes, descuentos y tickets de compra
+ROL_VENTAS_ID = 1568142333885808650           # Ve y atiende los tickets de compra (se le hace ping al abrirlos)
+TOP_MAXIMO = 10                               # Cuántos puestos muestra el top
+MEDALLAS = {1: "🥇", 2: "🥈", 3: "🥉"}
 
-def tarjeta_cliente(comprador: discord.Member, texto: str) -> discord.ui.LayoutView:
-    """Tarjeta azul: ping al comprador arriba, texto a la izquierda y su foto de perfil arriba a la derecha."""
-    contenedor = discord.ui.Container(accent_colour=COLOR_CLIENTES)
-    contenedor.add_item(discord.ui.Section(
-        discord.ui.TextDisplay(f"## 🤝 CLIENTES - {NOMBRE.upper()}\n{texto}"),
-        accessory=discord.ui.Thumbnail(comprador.display_avatar.url),
-    ))
+# Catálogo: la clave del servicio es el "tipo de servicio" (con emoji) y sus items son los "tipos de venta" (con precio)
+CATALOGO_VENTAS = {
+    "informativos": {
+        "nombre": "Servicios Informativos", "emoji": "📰",
+        "items": {
+            "nota":       {"nombre": "Nota informativa",    "precio": 15000},
+            "reportaje":  {"nombre": "Reportaje especial",  "precio": 30000},
+            "comunicado": {"nombre": "Comunicado oficial",  "precio": 45000},
+            "cobertura":  {"nombre": "Cobertura de evento", "precio": 75000},
+        },
+    },
+    "diseno": {
+        "nombre": "Diseño y Producción", "emoji": "🎨",
+        "items": {
+            "logotipo": {"nombre": "Diseño de logotipo",  "precio": 30000},
+            "banner":   {"nombre": "Banner publicitario", "precio": 50000},
+            "cartel":   {"nombre": "Cartel promocional",  "precio": 70000},
+        },
+    },
+    "paquetes": {
+        "nombre": "Paquetes Comerciales", "emoji": "🤝",
+        "items": {
+            "empresarial": {"nombre": "Paquete empresarial", "precio": 70000},
+            "faccion":     {"nombre": "Paquete facción",     "precio": 120000},
+            "premium":     {"nombre": "Paquete premium",     "precio": 170000},
+        },
+    },
+}
+
+RUTA_VENTAS = os.path.join(CARPETA_DATOS, "ventas.json")
+
+
+# ---------- Utilidades ----------
+
+def dinero(n) -> str:
+    return f"${int(n):,}"
+
+
+def _citar(valor) -> str:
+    # Mantiene el estilo de cita (>) aunque el texto tenga varias líneas
+    return str(valor).replace("\n", "\n> ")
+
+
+def puede_vender(interaction: discord.Interaction) -> bool:
+    # Empleados (ROL_EMPLEADO) o quien tenga Gestionar roles
+    miembro = interaction.user
+    if not isinstance(miembro, discord.Member):
+        return False
+    return miembro.guild_permissions.manage_roles or any(r.id == ROL_EMPLEADO for r in miembro.roles)
+
+
+def es_cliente_registrado(miembro: discord.Member) -> bool:
+    ids = {r.id for r in miembro.roles}
+    return ROL_SEPARADOR_CLIENTES in ids or any(c["rol"] in ids for c in NIVELES_CLIENTE.values())
+
+
+def mejor_descuento(miembro: discord.Member) -> Optional[int]:
+    ids = {r.id for r in miembro.roles}
+    porcentajes = [p for p, rol_id in ROLES_DESCUENTO.items() if rol_id in ids]
+    return max(porcentajes) if porcentajes else None
+
+
+def texto_nivel_cliente(miembro: discord.Member) -> str:
+    ids = {r.id for r in miembro.roles}
+    for nivel in (3, 2, 1):
+        if NIVELES_CLIENTE[nivel]["rol"] in ids:
+            return f"<@&{NIVELES_CLIENTE[nivel]['rol']}>"
+    return "`Sin registrar`"
+
+
+def construir_tarjeta(titulo: str, texto: str, miniatura: Optional[str] = None, pie: Optional[str] = None,
+                      ping: Optional[str] = None, fila=None, color=COLOR_CLIENTES) -> discord.ui.LayoutView:
+    """Tarjeta azul: ping arriba (opcional), título + texto, foto arriba a la derecha, separador y pie."""
+    contenedor = discord.ui.Container(accent_colour=color)
+    cuerpo = discord.ui.TextDisplay(f"## {titulo}\n{texto}"[:3800])
+    if miniatura:
+        contenedor.add_item(discord.ui.Section(cuerpo, accessory=discord.ui.Thumbnail(miniatura)))
+    else:
+        contenedor.add_item(cuerpo)
     contenedor.add_item(discord.ui.Separator())
-    contenedor.add_item(discord.ui.TextDisplay(
-        f"-# {NOMBRE} · {datetime.now(ZONA_HORARIA).strftime('%d/%m/%Y')}"
-    ))
+    contenedor.add_item(discord.ui.TextDisplay(f"-# {pie or NOMBRE}"))
+    if fila is not None:
+        contenedor.add_item(fila)
 
     vista = discord.ui.LayoutView(timeout=None)
-    vista.add_item(discord.ui.TextDisplay(comprador.mention))   # el ping al comprador va arriba de la tarjeta
+    if ping:
+        vista.add_item(discord.ui.TextDisplay(ping))
     vista.add_item(contenedor)
     return vista
+
+
+def _fecha_hoy() -> str:
+    return datetime.now(ZONA_HORARIA).strftime("%d/%m/%Y")
+
+
+def tarjeta_cliente(comprador: discord.Member, texto: str) -> discord.ui.LayoutView:
+    return construir_tarjeta(
+        f"🤝 CLIENTES - {NOMBRE.upper()}", texto,
+        miniatura=comprador.display_avatar.url,
+        pie=f"{NOMBRE} · {_fecha_hoy()}",
+        ping=comprador.mention,
+    )
 
 
 async def publicar_tarjeta_cliente(interaction: discord.Interaction, comprador: discord.Member, texto: str):
@@ -3736,6 +3879,56 @@ async def publicar_tarjeta_cliente(interaction: discord.Interaction, comprador: 
     )
 
 
+async def log_ventas(titulo: str, partes: list):
+    """Log en el canal CANAL_LOGS_VENTAS_ID. partes = [(nombre, valor), ...]"""
+    if not CANAL_LOGS_VENTAS_ID:
+        return
+    try:
+        canal = await _canal_por_id(CANAL_LOGS_VENTAS_ID)
+        if canal is None:
+            print(f" No encontré el canal de logs de ventas {CANAL_LOGS_VENTAS_ID}.")
+            return
+        texto = "\n".join(f"> **{nombre}:** {_citar(valor)}" for nombre, valor in partes)
+        vista = construir_tarjeta(titulo, texto, pie=f"{NOMBRE} · Logs · {_fecha_hoy()}")
+        await canal.send(view=vista, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f" Error enviando el log de ventas: {e!r}")
+
+
+# ---------- Datos de ventas ----------
+
+def _cargar_ventas() -> dict:
+    try:
+        with open(RUTA_VENTAS, "r", encoding="utf-8") as f:
+            datos = json.load(f)
+        if not isinstance(datos, dict):
+            datos = {}
+    except FileNotFoundError:
+        datos = {}
+    except Exception as e:
+        print(f" No pude leer {RUTA_VENTAS}: {e}")
+        datos = {}
+    datos.setdefault("siguiente", 1)   # número de la próxima venta
+    datos.setdefault("ventas", [])     # [{id, ts, comprador, vendedor, servicio, tipo, nombre, precio_lista, descuento, precio}]
+    return datos
+
+
+DATOS_VENTAS: dict = _cargar_ventas()
+
+
+def _guardar_ventas():
+    try:
+        os.makedirs(CARPETA_DATOS, exist_ok=True)
+        tmp = RUTA_VENTAS + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(DATOS_VENTAS, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, RUTA_VENTAS)
+    except Exception as e:
+        print(f" No pude guardar {RUTA_VENTAS}: {e}")
+
+
+# ---------- /cliente ----------
+
 @bot.tree.command(name="cliente", description="Registra a un comprador como cliente y le asigna su nivel y descuento")
 @app_commands.describe(comprador="Usuario que realizó la compra", nivel="Nivel de cliente que se le asigna")
 @app_commands.choices(nivel=[
@@ -3743,7 +3936,7 @@ async def publicar_tarjeta_cliente(interaction: discord.Interaction, comprador: 
     app_commands.Choice(name="Nivel 2 · Cliente Frecuente (30% de descuento)", value=2),
     app_commands.Choice(name="Nivel 3 · Cliente Destacado (50% de descuento)", value=3),
 ])
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.check(puede_vender)
 @app_commands.guild_only()
 async def cliente(interaction: discord.Interaction, comprador: discord.Member, nivel: app_commands.Choice[int]):
     guild = interaction.guild
@@ -3800,10 +3993,18 @@ async def cliente(interaction: discord.Interaction, comprador: discord.Member, n
         mensaje = await publicar_tarjeta_cliente(interaction, comprador, texto)
     except Exception as e:
         print(f" Error enviando la tarjeta de cliente: {e!r}")
-        return await interaction.followup.send(
+        await interaction.followup.send(
             f"Los roles se asignaron, pero no pude publicar la tarjeta: `{type(e).__name__}: {e}`", ephemeral=True)
+        mensaje = None
 
-    await interaction.followup.send(f"Cliente registrado: {mensaje.jump_url}", ephemeral=True)
+    await log_ventas("🤝 CLIENTE REGISTRADO", [
+        ("Cliente", f"{comprador.mention} (`{comprador.id}`)"),
+        ("Nivel", f"{rol_nivel.mention} · `{cfg['descuento']}%` de descuento"),
+        ("Registrado por", interaction.user.mention),
+        ("Canal", interaction.channel.mention),
+    ])
+    if mensaje is not None:
+        await interaction.followup.send(f"Cliente registrado: {mensaje.jump_url}", ephemeral=True)
 
 
 # ---------- Descuentos voluntarios ----------
@@ -3862,16 +4063,24 @@ async def descuento_dar(
         f"Puedes usarlo en tu siguiente compra."
     )
     if motivo:
-        texto += f"\n\n**Motivo:** {motivo}"
+        texto += f"\n\n> **Motivo:** {_citar(motivo)}"
 
     try:
         mensaje = await publicar_tarjeta_cliente(interaction, usuario, texto)
     except Exception as e:
         print(f" Error enviando la tarjeta de descuento: {e!r}")
-        return await interaction.followup.send(
+        await interaction.followup.send(
             f"El descuento se asignó, pero no pude publicar la tarjeta: `{type(e).__name__}: {e}`", ephemeral=True)
+        mensaje = None
 
-    await interaction.followup.send(f"Descuento otorgado: {mensaje.jump_url}", ephemeral=True)
+    await log_ventas("🏷️ DESCUENTO OTORGADO", [
+        ("Usuario", f"{usuario.mention} (`{usuario.id}`)"),
+        ("Descuento", f"{rol.mention} · `{porcentaje.value}%`"),
+        ("Otorgado por", interaction.user.mention),
+        ("Motivo", motivo or "`Sin motivo`"),
+    ])
+    if mensaje is not None:
+        await interaction.followup.send(f"Descuento otorgado: {mensaje.jump_url}", ephemeral=True)
 
 
 @bot.tree.command(name="descuento-quitar", description="Quita un descuento a un usuario (si no eliges porcentaje, quita todos)")
@@ -3909,7 +4118,683 @@ async def descuento_quitar(
         return await interaction.followup.send(f"Discord no me dejó quitar el rol: `{e}`", ephemeral=True)
 
     lista = ", ".join(r.mention for r in roles)
+    await log_ventas("❎ DESCUENTO RETIRADO", [
+        ("Usuario", f"{usuario.mention} (`{usuario.id}`)"),
+        ("Descuento", lista),
+        ("Retirado por", interaction.user.mention),
+    ])
     await interaction.followup.send(f"Descuento retirado a {usuario.mention}: {lista}", ephemeral=True)
+
+
+# ---------- /venta ----------
+
+async def autocompletar_tipo_venta(interaction: discord.Interaction, current: str):
+    # Si ya eligió el tipo de servicio, solo se ofrecen las ventas de ese servicio
+    elegido = getattr(interaction.namespace, "servicio", None)
+    grupos = [elegido] if elegido in CATALOGO_VENTAS else list(CATALOGO_VENTAS)
+    opciones = []
+    for g in grupos:
+        for clave, item in CATALOGO_VENTAS[g]["items"].items():
+            if current.lower() in item["nombre"].lower():
+                opciones.append(app_commands.Choice(
+                    name=f"{item['nombre']} — {dinero(item['precio'])}", value=f"{g}:{clave}"))
+    return opciones[:25]
+
+
+@bot.tree.command(name="venta", description="Registra una venta a un cliente registrado")
+@app_commands.describe(
+    comprador="Cliente registrado que compra",
+    servicio="Tipo de servicio",
+    tipo_venta="Tipo de venta (depende del servicio elegido)",
+    aplicar_descuento="¿Aplicar el descuento del cliente? Se consume al usarlo (por defecto no)",
+)
+@app_commands.choices(servicio=[
+    app_commands.Choice(name=f"{c['emoji']} {c['nombre']}", value=k) for k, c in CATALOGO_VENTAS.items()
+])
+@app_commands.autocomplete(tipo_venta=autocompletar_tipo_venta)
+@app_commands.check(puede_vender)
+@app_commands.guild_only()
+async def venta(
+    interaction: discord.Interaction,
+    comprador: discord.Member,
+    servicio: app_commands.Choice[str],
+    tipo_venta: str,
+    aplicar_descuento: bool = False,
+):
+    guild = interaction.guild
+    vendedor = interaction.user
+
+    if comprador.bot:
+        return await interaction.response.send_message("No puedes venderle a un bot.", ephemeral=True)
+    if comprador.id == vendedor.id:
+        return await interaction.response.send_message("No puedes registrarte una venta a ti mismo.", ephemeral=True)
+    if not es_cliente_registrado(comprador):
+        return await interaction.response.send_message(
+            f"{comprador.mention} todavía no está registrado como cliente. Usa `/cliente` primero.", ephemeral=True)
+    if interaction.channel is None:
+        return await interaction.response.send_message("No pude determinar el canal donde publicar.", ephemeral=True)
+
+    grupo, _, clave = tipo_venta.partition(":")
+    item = CATALOGO_VENTAS.get(grupo, {}).get("items", {}).get(clave)
+    if grupo != servicio.value or item is None:
+        return await interaction.response.send_message(
+            "Ese tipo de venta no pertenece al servicio elegido. Escoge una opción de la lista.", ephemeral=True)
+    categoria = CATALOGO_VENTAS[grupo]
+
+    precio_lista = item["precio"]
+    porcentaje = 0
+    rol_descuento = None
+    if aplicar_descuento:
+        porcentaje = mejor_descuento(comprador)
+        if not porcentaje:
+            return await interaction.response.send_message(
+                f"{comprador.mention} no tiene ningún descuento disponible.", ephemeral=True)
+        rol_descuento = guild.get_role(ROLES_DESCUENTO[porcentaje])
+        if rol_descuento is None:
+            return await interaction.response.send_message("No encontré el rol de ese descuento en el servidor.", ephemeral=True)
+        error = error_jerarquia(guild, comprador, [rol_descuento])
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+    precio = round(precio_lista * (100 - porcentaje) / 100)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # El descuento se consume ANTES de guardar la venta: si no se puede quitar, no se registra nada
+    if rol_descuento is not None:
+        try:
+            await comprador.remove_roles(rol_descuento, reason=f"Descuento usado en venta por {vendedor}")
+        except discord.Forbidden:
+            return await interaction.followup.send(
+                "No pude consumir el descuento. Revisa que el bot tenga **Gestionar roles** y esté por encima de él.",
+                ephemeral=True)
+        except discord.HTTPException as e:
+            return await interaction.followup.send(f"Discord no me dejó consumir el descuento: `{e}`", ephemeral=True)
+
+    numero = DATOS_VENTAS["siguiente"]
+    DATOS_VENTAS["ventas"].append({
+        "id": numero,
+        "ts": int(datetime.now(timezone.utc).timestamp()),
+        "comprador": comprador.id,
+        "vendedor": vendedor.id,
+        "servicio": grupo,
+        "tipo": clave,
+        "nombre": item["nombre"],
+        "precio_lista": precio_lista,
+        "descuento": porcentaje,
+        "precio": precio,
+    })
+    DATOS_VENTAS["siguiente"] = numero + 1
+    _guardar_ventas()
+
+    if porcentaje:
+        linea_precio = f"> 💰 ~~{dinero(precio_lista)}~~ ➜ **{dinero(precio)}**\n> 🏷️ Descuento aplicado: `{porcentaje}%`"
+    else:
+        linea_precio = f"> 💰 **Precio:** `{dinero(precio)}`"
+    texto = (
+        f"{vendedor.mention} registró una venta para {comprador.mention}\n\n"
+        f"> {categoria['emoji']} **{categoria['nombre']}**\n"
+        f"> 🧾 `{item['nombre']}`\n"
+        f"{linea_precio}\n\n"
+        f"*Gracias por confiar en {NOMBRE}.*"
+    )
+    vista = construir_tarjeta(
+        f"🛒 VENTAS - {NOMBRE.upper()}", texto,
+        miniatura=comprador.display_avatar.url,
+        pie=f"{NOMBRE} · Venta #{numero} · {_fecha_hoy()}",
+        ping=comprador.mention,
+    )
+
+    mensaje = None
+    try:
+        mensaje = await interaction.channel.send(
+            view=vista, allowed_mentions=discord.AllowedMentions(users=[comprador], roles=False))
+    except Exception as e:
+        print(f" Error enviando la tarjeta de venta: {e!r}")
+        await interaction.followup.send(
+            f"La venta **#{numero}** quedó guardada, pero no pude publicar la tarjeta: `{type(e).__name__}: {e}`",
+            ephemeral=True)
+
+    await log_ventas("🧾 VENTA REGISTRADA", [
+        ("Venta", f"`#{numero}`"),
+        ("Vendedor", f"{vendedor.mention} (`{vendedor.id}`)"),
+        ("Comprador", f"{comprador.mention} (`{comprador.id}`)"),
+        ("Servicio", f"{categoria['emoji']} {categoria['nombre']}"),
+        ("Tipo de venta", f"`{item['nombre']}`"),
+        ("Precio", f"`{dinero(precio)}`" + (f" (lista `{dinero(precio_lista)}`, `-{porcentaje}%`)" if porcentaje else "")),
+        ("Canal", interaction.channel.mention),
+    ])
+    if mensaje is not None:
+        await interaction.followup.send(f"Venta **#{numero}** registrada: {mensaje.jump_url}", ephemeral=True)
+
+
+@bot.tree.command(name="venta-eliminar", description="Elimina una venta mal registrada (no devuelve descuentos usados)")
+@app_commands.describe(numero="Número de la venta (aparece en el pie de la tarjeta, ej. #12)")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def venta_eliminar(interaction: discord.Interaction, numero: app_commands.Range[int, 1, 10000000]):
+    encontrada = next((v for v in DATOS_VENTAS["ventas"] if v["id"] == numero), None)
+    if encontrada is None:
+        return await interaction.response.send_message(f"No encontré la venta `#{numero}`.", ephemeral=True)
+
+    DATOS_VENTAS["ventas"].remove(encontrada)
+    _guardar_ventas()
+
+    await log_ventas("🗑️ VENTA ELIMINADA", [
+        ("Venta", f"`#{numero}`"),
+        ("Comprador", f"<@{encontrada['comprador']}>"),
+        ("Vendedor", f"<@{encontrada['vendedor']}>"),
+        ("Tipo de venta", f"`{encontrada['nombre']}` · `{dinero(encontrada['precio'])}`"),
+        ("Eliminada por", interaction.user.mention),
+    ])
+    await interaction.response.send_message(
+        f"Venta `#{numero}` eliminada ({encontrada['nombre']} · {dinero(encontrada['precio'])}).", ephemeral=True)
+
+
+# ---------- /top servicios ----------
+
+def _acumular(ventas: list, campo: str) -> list:
+    """[(id_usuario, {"n": ventas, "total": dinero, "serv": {servicio: dinero}})] de mayor a menor dinero."""
+    datos = {}
+    for v in ventas:
+        e = datos.setdefault(v[campo], {"n": 0, "total": 0, "serv": {}})
+        e["n"] += 1
+        e["total"] += v["precio"]
+        e["serv"][v["servicio"]] = e["serv"].get(v["servicio"], 0) + v["precio"]
+    return sorted(datos.items(), key=lambda kv: (-kv[1]["total"], -kv[1]["n"], kv[0]))
+
+
+def _desglose(serv: dict) -> str:
+    return " · ".join(f"{c['emoji']} `{dinero(serv[k])}`" for k, c in CATALOGO_VENTAS.items() if serv.get(k))
+
+
+def _puesto(lista: list, uid: int) -> Optional[int]:
+    for i, (otro, _) in enumerate(lista, start=1):
+        if otro == uid:
+            return i
+    return None
+
+
+def _plural(n: int, singular: str, plural: str) -> str:
+    return singular if n == 1 else plural
+
+
+def _boton_fila(fila: discord.ui.ActionRow, clave: str, etiqueta: str, emoji: str, id_boton: str, activo: bool, callback):
+    boton = discord.ui.Button(
+        label=etiqueta, emoji=emoji, custom_id=id_boton, disabled=activo,
+        style=discord.ButtonStyle.primary if activo else discord.ButtonStyle.secondary,
+    )
+    boton.callback = callback
+    fila.add_item(boton)
+
+
+class FilaTop(discord.ui.ActionRow):
+    # Botones Compradores / Vendedores del top general. modo=None = ninguno activo (para registrar la vista al iniciar)
+
+    def __init__(self, modo: Optional[str] = None):
+        super().__init__()
+        _boton_fila(self, "compradores", "Compradores", "🛍️", "top_compradores", modo == "compradores", self._ir_compradores)
+        _boton_fila(self, "vendedores", "Vendedores", "💼", "top_vendedores", modo == "vendedores", self._ir_vendedores)
+
+    async def _ir_compradores(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=vista_top_general("compradores"))
+
+    async def _ir_vendedores(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(view=vista_top_general("vendedores"))
+
+
+def vista_top_general(modo: str) -> discord.ui.LayoutView:
+    ventas = DATOS_VENTAS["ventas"]
+    vendedores = (modo == "vendedores")
+    filas = _acumular(ventas, "vendedor" if vendedores else "comprador")[:TOP_MAXIMO]
+
+    if not filas:
+        cuerpo = "*Aún no hay ventas registradas.*"
+    else:
+        lineas = []
+        for i, (uid, e) in enumerate(filas, start=1):
+            medalla = MEDALLAS.get(i, "🔹")
+            if vendedores:
+                linea = (f"{medalla} `{i}.-` <@{uid}> ha vendido un total de `{e['n']}` "
+                         f"{_plural(e['n'], 'venta', 'ventas')} y conseguido `{dinero(e['total'])}`")
+            else:
+                linea = (f"{medalla} `{i}.-` <@{uid}> ha comprado un total de `{e['n']}` "
+                         f"{_plural(e['n'], 'servicio', 'servicios')} y gastado `{dinero(e['total'])}`")
+            desglose = _desglose(e["serv"])
+            if desglose:
+                linea += f"\n> {desglose}"
+            lineas.append(linea)
+        cuerpo = "\n\n".join(lineas)
+
+    total = sum(v["precio"] for v in ventas)
+    texto = (
+        f"*{'Vendedores' if vendedores else 'Compradores'} con más movimiento.*\n"
+        f"> 💰 Ingresos de la empresa: `{dinero(total)}`\n"
+        f"> 🧾 Ventas registradas: `{len(ventas)}`\n\n"
+        f"{cuerpo}"
+    )
+    return construir_tarjeta(
+        f"🏆 TOP SERVICIOS - {NOMBRE.upper()}", texto,
+        pie=f"{NOMBRE} · Top {TOP_MAXIMO} · ordenado por dinero",
+        fila=FilaTop(modo),
+    )
+
+
+class FilaTopUsuario(discord.ui.ActionRow):
+    # Botones Resumen / Compras / Ventas del perfil de un usuario
+
+    def __init__(self, modo: Optional[str] = None):
+        super().__init__()
+        for clave, etiqueta, emoji in (("resumen", "Resumen", "📊"), ("compras", "Sus compras", "🛍️"), ("ventas", "Sus ventas", "💼")):
+            _boton_fila(self, clave, etiqueta, emoji, f"topu_{clave}", modo == clave, self._crear_ir(clave))
+
+    def _crear_ir(self, clave: str):
+        async def ir(interaction: discord.Interaction):
+            await cambiar_vista_usuario(interaction, clave)
+        return ir
+
+
+def vista_top_usuario(usuario, modo: str) -> discord.ui.LayoutView:
+    ventas = DATOS_VENTAS["ventas"]
+    top_compras = _acumular(ventas, "comprador")
+    top_ventas = _acumular(ventas, "vendedor")
+
+    if modo == "compras" or modo == "ventas":
+        es_compra = (modo == "compras")
+        propias = [v for v in ventas if v["comprador" if es_compra else "vendedor"] == usuario.id]
+        propias.sort(key=lambda v: v["ts"], reverse=True)
+        if not propias:
+            cuerpo = f"*{'Sin compras' if es_compra else 'Sin ventas'} registradas.*"
+        else:
+            lineas = []
+            for v in propias[:TOP_MAXIMO]:
+                emoji = CATALOGO_VENTAS.get(v["servicio"], {}).get("emoji", "🧾")
+                otro = f"<@{v['vendedor']}>" if es_compra else f"<@{v['comprador']}>"
+                etiqueta = "vendedor" if es_compra else "comprador"
+                con_descuento = f" · `-{v['descuento']}%`" if v.get("descuento") else ""
+                lineas.append(
+                    f"> `#{v['id']}` {emoji} `{v['nombre']}` · `{dinero(v['precio'])}`{con_descuento}\n"
+                    f"> ↳ {etiqueta} {otro} · <t:{v['ts']}:d>")
+            cuerpo = "\n\n".join(lineas)
+        titulo = "🛍️ COMPRAS" if es_compra else "💼 VENTAS"
+        texto = f"{usuario.mention}\n*Últimos movimientos (máx. {TOP_MAXIMO}).*\n\n{cuerpo}"
+    else:
+        def bloque(titulo, lista, verbo, unidad):
+            puesto = _puesto(lista, usuario.id)
+            datos = dict(lista).get(usuario.id)
+            if datos is None:
+                return f"> {titulo}\n> *Sin movimientos registrados.*"
+            linea = (f"> {titulo} · puesto `#{puesto}`\n"
+                     f"> `{datos['n']}` {unidad[0] if datos['n'] == 1 else unidad[1]} · `{dinero(datos['total'])}` {verbo}")
+            desglose = _desglose(datos["serv"])
+            return linea + (f"\n> {desglose}" if desglose else "")
+        texto = (
+            f"{usuario.mention}\n\n"
+            + bloque("🛍️ **Como comprador**", top_compras, "gastados", ("servicio", "servicios")) + "\n\n"
+            + bloque("💼 **Como vendedor**", top_ventas, "generados", ("venta", "ventas"))
+        )
+        titulo = "📊 PERFIL"
+
+    return construir_tarjeta(
+        f"{titulo} - {NOMBRE.upper()}", texto,
+        miniatura=usuario.display_avatar.url,
+        pie=f"{NOMBRE} · ID {usuario.id}",     # el ID se usa para que los botones sepan de quién es el perfil
+        fila=FilaTopUsuario(modo),
+    )
+
+
+async def cambiar_vista_usuario(interaction: discord.Interaction, modo: str):
+    texto = _texto_de_componentes(interaction.message.components)
+    coincidencia = re.search(r"ID (\d{15,20})", texto)
+    if not coincidencia:
+        return await interaction.response.send_message("No pude identificar de quién es este perfil.", ephemeral=True)
+    uid = int(coincidencia.group(1))
+    usuario = interaction.guild.get_member(uid)
+    if usuario is None:
+        try:
+            usuario = await bot.fetch_user(uid)
+        except Exception:
+            return await interaction.response.send_message("No pude encontrar a ese usuario.", ephemeral=True)
+    await interaction.response.edit_message(view=vista_top_usuario(usuario, modo))
+
+
+top = app_commands.Group(name="top", description="Rankings de la empresa", guild_only=True)
+
+
+@top.command(name="servicios", description="Top de compradores y vendedores, o el perfil de un usuario")
+@app_commands.describe(usuario="Opcional: ver las compras y ventas de un usuario")
+async def top_servicios(interaction: discord.Interaction, usuario: Optional[discord.Member] = None):
+    vista = vista_top_usuario(usuario, "resumen") if usuario else vista_top_general("compradores")
+    await interaction.response.send_message(view=vista, allowed_mentions=discord.AllowedMentions.none())
+
+
+bot.tree.add_command(top)
+
+
+# ---------- Tickets de compra (copia del sistema de tickets, con su propia categoría y botón) ----------
+
+def _venta_dueno_id(canal) -> Optional[int]:
+    coincidencia = re.search(r"compra:(\d+)", getattr(canal, "topic", None) or "")
+    return int(coincidencia.group(1)) if coincidencia else None
+
+
+def _venta_ticket_abierto_de(guild: discord.Guild, uid: int):
+    categoria = guild.get_channel(CATEGORIA_VENTAS_ID)
+    if not isinstance(categoria, discord.CategoryChannel):
+        return None
+    for canal in categoria.text_channels:
+        if _venta_dueno_id(canal) == uid:
+            return canal
+    return None
+
+
+def _es_staff_venta(usuario) -> bool:
+    if not isinstance(usuario, discord.Member):
+        return False
+    permisos = usuario.guild_permissions
+    if permisos.administrator or permisos.manage_channels:
+        return True
+    return any(r.id == ROL_VENTAS_ID for r in usuario.roles)
+
+
+class VentaTicketModal(_ModalTicket, title="Abrir Ticket de Compra"):
+
+    servicio = discord.ui.Label(
+        text="Servicio que deseas comprar",
+        description="Elige el tipo de servicio.",
+        component=discord.ui.Select(
+            placeholder="Elige un servicio",
+            options=[
+                discord.SelectOption(label=c["nombre"], value=k, emoji=c["emoji"])
+                for k, c in CATALOGO_VENTAS.items()
+            ] + [discord.SelectOption(label="Otro / Personalizado", value="otro", emoji="🧩")],
+        ),
+    )
+    detalles = discord.ui.Label(
+        text="¿Qué quieres comprar?",
+        description="Especifica el servicio y tus requerimientos.",
+        component=discord.ui.TextInput(
+            style=discord.TextStyle.paragraph,
+            placeholder="Ej: Una nota informativa sobre el evento de mi facción...",
+            max_length=1000,
+        ),
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        guild = interaction.guild
+        usuario = interaction.user
+        clave = self.servicio.component.values[0]
+        detalles = self.detalles.component.value.strip()
+        if clave in CATALOGO_VENTAS:
+            servicio_txt = f"{CATALOGO_VENTAS[clave]['emoji']} {CATALOGO_VENTAS[clave]['nombre']}"
+        else:
+            servicio_txt = "🧩 Otro / Personalizado"
+
+        categoria = guild.get_channel(CATEGORIA_VENTAS_ID)
+        if not isinstance(categoria, discord.CategoryChannel):
+            return await interaction.response.send_message(
+                "No encontré la categoría de tickets de compra. Avisa a un directivo.", ephemeral=True)
+
+        # Crear el canal puede tardar más de 3 segundos
+        await interaction.response.defer(ephemeral=True)
+
+        existente = _venta_ticket_abierto_de(guild, usuario.id)
+        if existente:
+            return await interaction.followup.send(f"Ya tienes un ticket de compra abierto: {existente.mention}", ephemeral=True)
+
+        rol_staff = guild.get_role(ROL_VENTAS_ID)
+        permisos_usuario = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+        sobrescrituras = {
+            guild.default_role: discord.PermissionOverwrite(view_channel=False),
+            guild.me: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, embed_links=True,
+                attach_files=True, manage_channels=True),
+            usuario: permisos_usuario,
+        }
+        if rol_staff is not None:
+            sobrescrituras[rol_staff] = discord.PermissionOverwrite(
+                view_channel=True, send_messages=True, read_message_history=True, attach_files=True, embed_links=True)
+
+        slug = re.sub(r"[^a-z0-9-]", "", usuario.name.lower().replace(" ", "-"))[:60] or str(usuario.id)
+        canal = None
+        try:
+            canal = await guild.create_text_channel(
+                name=f"compra-{slug}",
+                category=categoria,
+                topic=f"Ticket de compra de {usuario.name} | compra:{usuario.id}",
+                overwrites=sobrescrituras,
+                reason=f"Ticket de compra abierto por {usuario}",
+            )
+
+            ahora = int(datetime.now(timezone.utc).timestamp())
+            descuento = mejor_descuento(usuario) if isinstance(usuario, discord.Member) else None
+            linea_cliente = f"> 💎 **Cliente:** {texto_nivel_cliente(usuario)}"
+            if descuento:
+                linea_cliente += f" · 🏷️ `{descuento}%` disponible"
+
+            texto = (
+                f"> 👤 **Solicitante:** {usuario.mention}\n"
+                f"> 🛍️ **Servicio:** {servicio_txt}\n"
+                f"{linea_cliente}\n\n"
+                f"**Detalles de la compra:**\n> {_citar(detalles)}\n\n"
+                f"*Abierto:* <t:{ahora}:F>"
+            )
+            vista = construir_tarjeta(
+                "🛒 TICKET DE COMPRA", texto,
+                miniatura=usuario.display_avatar.url,
+                pie=f"{NOMBRE} · Un miembro del equipo te atenderá en breve.",
+                ping=usuario.mention + (f" <@&{ROL_VENTAS_ID}>" if rol_staff is not None else ""),
+                fila=FilaCerrarVenta(),
+            )
+            await canal.send(
+                view=vista,
+                allowed_mentions=discord.AllowedMentions(
+                    users=[usuario],
+                    roles=[discord.Object(id=ROL_VENTAS_ID)] if rol_staff is not None else False,
+                ),
+            )
+        except Exception as e:
+            print(f" Error creando el ticket de compra de {usuario}: {e!r}")
+            if canal is not None:
+                try:
+                    await canal.delete(reason="Falló la creación del ticket de compra")
+                except Exception:
+                    pass
+            return await interaction.followup.send(
+                "No pude crear el ticket. Revisa que el bot tenga **Gestionar canales** y **Gestionar roles**.",
+                ephemeral=True)
+
+        await log_ventas("🛒 TICKET DE COMPRA ABIERTO", [
+            ("Usuario", f"{usuario.mention} (`{usuario.id}`)"),
+            ("Servicio", servicio_txt),
+            ("Detalles", detalles),
+            ("Canal", canal.mention),
+        ])
+        await interaction.followup.send(f"Tu ticket de compra fue creado: {canal.mention}", ephemeral=True)
+
+
+async def abrir_ticket_venta(interaction: discord.Interaction):
+    guild = interaction.guild
+    if not isinstance(guild.get_channel(CATEGORIA_VENTAS_ID), discord.CategoryChannel):
+        return await interaction.response.send_message(
+            "No encontré la categoría de tickets de compra. Avisa a un directivo.", ephemeral=True)
+
+    existente = _venta_ticket_abierto_de(guild, interaction.user.id)
+    if existente:
+        return await interaction.response.send_message(
+            f"Ya tienes un ticket de compra abierto: {existente.mention}", ephemeral=True)
+
+    await interaction.response.send_modal(VentaTicketModal())
+
+
+class ConfirmarCierreVentaView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label="Sí, cerrar ticket", style=discord.ButtonStyle.danger, emoji="🔒")
+    async def confirmar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        canal = interaction.channel
+        dueno = _venta_dueno_id(canal)
+        if dueno is None or (interaction.user.id != dueno and not _es_staff_venta(interaction.user)):
+            return await interaction.response.edit_message(content="No puedes cerrar este ticket.", view=None)
+
+        self.stop()
+        await interaction.response.edit_message(content="🔒 Cerrando el ticket…", view=None)
+        await log_ventas("🔒 TICKET DE COMPRA CERRADO", [
+            ("Ticket", f"`#{canal.name}`"),
+            ("Dueño", f"<@{dueno}> (`{dueno}`)"),
+            ("Cerrado por", interaction.user.mention),
+        ])
+        await asyncio.sleep(3)
+        try:
+            await canal.delete(reason=f"Ticket de compra cerrado por {interaction.user}")
+        except Exception as e:
+            print(f" No pude borrar el canal del ticket de compra: {e!r}")
+
+    @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+    async def cancelar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.stop()
+        await interaction.response.edit_message(content="El ticket sigue abierto.", view=None)
+
+
+async def cerrar_ticket_venta(interaction: discord.Interaction):
+    dueno = _venta_dueno_id(interaction.channel)
+    if dueno is None:
+        return await interaction.response.send_message("Este canal no es un ticket de compra.", ephemeral=True)
+    if interaction.user.id != dueno and not _es_staff_venta(interaction.user):
+        return await interaction.response.send_message(
+            "Solo quien abrió el ticket o el equipo de ventas puede cerrarlo.", ephemeral=True)
+    await interaction.response.send_message(
+        "¿Seguro que quieres cerrar este ticket? Se eliminará el canal.",
+        view=ConfirmarCierreVentaView(), ephemeral=True)
+
+
+class FilaVentaAbrir(discord.ui.ActionRow):
+    # Botón "🛒 Abrir ticket para comprar" para mensajes V2 (tarjetas)
+
+    @discord.ui.button(label="Abrir ticket para comprar", emoji="🛒", style=discord.ButtonStyle.primary, custom_id="venta_abrir")
+    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await abrir_ticket_venta(interaction)
+
+
+class FilaCerrarVenta(discord.ui.ActionRow):
+
+    @discord.ui.button(label="Cerrar ticket", emoji="🔒", style=discord.ButtonStyle.secondary, custom_id="venta_cerrar")
+    async def cerrar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await cerrar_ticket_venta(interaction)
+
+
+class VentaLayoutView(discord.ui.LayoutView):
+    # Solo sirve para que los botones sigan funcionando después de reiniciar el bot
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(FilaVentaAbrir())
+        self.add_item(FilaCerrarVenta())
+        self.add_item(FilaTop())
+        self.add_item(FilaTopUsuario())
+
+
+class PanelVentaView(discord.ui.View):
+    # Botón "🛒 Abrir ticket para comprar" para mensajes normales (embed clásico)
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Abrir ticket para comprar", emoji="🛒", style=discord.ButtonStyle.primary, custom_id="venta_abrir")
+    async def abrir(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await abrir_ticket_venta(interaction)
+
+
+@bot.tree.command(name="panel-ventas", description="Pone el botón 🛒 Abrir ticket para comprar en un mensaje (o publica un panel nuevo)")
+@app_commands.describe(mensaje_id="ID (o link) de un mensaje del bot, tu embed de servicios, al que se le pone el botón. Vacío = panel nuevo")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.guild_only()
+async def panel_ventas(interaction: discord.Interaction, mensaje_id: Optional[str] = None):
+    guild = interaction.guild
+
+    if not isinstance(guild.get_channel(CATEGORIA_VENTAS_ID), discord.CategoryChannel):
+        return await interaction.response.send_message(
+            "No encontré la categoría de tickets de compra. Revisa CATEGORIA_VENTAS_ID.", ephemeral=True)
+
+    await interaction.response.defer(ephemeral=True)
+
+    # ---- Panel nuevo (sin ID) ----
+    if not mensaje_id:
+        bloques = []
+        for c in CATALOGO_VENTAS.values():
+            lineas = "\n".join(f"> `{i['nombre']}` · `{dinero(i['precio'])}`" for i in c["items"].values())
+            bloques.append(f"{c['emoji']} **{c['nombre']}**\n{lineas}")
+        texto = (
+            f"*Impulsa tu empresa, facción o proyecto con nuestros servicios.*\n\n"
+            + "\n\n".join(bloques)
+            + "\n\n-# Pulsa el botón, cuéntanos qué quieres comprar y abriremos un ticket privado para ti."
+        )
+        contenedor = discord.ui.Container(accent_colour=COLOR_CLIENTES)
+        contenedor.add_item(discord.ui.TextDisplay(f"## 🛒 COMPRAR - {NOMBRE.upper()}\n{texto}"))
+        contenedor.add_item(FilaVentaAbrir())
+        vista = discord.ui.LayoutView(timeout=None)
+        vista.add_item(contenedor)
+        try:
+            mensaje = await interaction.channel.send(view=vista)
+        except Exception as e:
+            return await interaction.followup.send(f"No pude publicar el panel. Error: `{type(e).__name__}: {e}`", ephemeral=True)
+        return await interaction.followup.send(f"Panel de compras publicado: {mensaje.jump_url}", ephemeral=True)
+
+    # ---- Ponerle el botón a un mensaje que ya existe ----
+    canal = interaction.channel
+    texto_id = mensaje_id.strip()
+    enlace = re.search(r"channels/(\d+)/(\d+)/(\d+)", texto_id)
+    try:
+        if enlace:
+            if int(enlace.group(1)) != guild.id:
+                return await interaction.followup.send("Ese mensaje no es de este servidor.", ephemeral=True)
+            canal = guild.get_channel_or_thread(int(enlace.group(2))) or await bot.fetch_channel(int(enlace.group(2)))
+            numero = int(enlace.group(3))
+        else:
+            numero = int(texto_id)
+        mensaje = await canal.fetch_message(numero)
+    except (ValueError, discord.NotFound, discord.Forbidden, discord.HTTPException):
+        return await interaction.followup.send(
+            "No encontré ese mensaje. Usa el comando en el mismo canal del mensaje o pega su link.", ephemeral=True)
+
+    if mensaje.author.id != bot.user.id:
+        return await interaction.followup.send(
+            "Ese mensaje no es del bot, así que no le puedo poner el botón. Publica tu embed con /embed y usa su ID.",
+            ephemeral=True)
+
+    if _buscar_custom_id(mensaje.components, "venta_abrir"):
+        return await interaction.followup.send("Ese mensaje ya tiene el botón de compras.", ephemeral=True)
+
+    try:
+        if getattr(mensaje.flags, "components_v2", False):
+            # Mensaje V2 (tarjeta): se conserva todo y se agrega el botón al final
+            vista = discord.ui.LayoutView.from_message(mensaje, timeout=None)
+            vista.add_item(FilaVentaAbrir())
+            await mensaje.edit(view=vista, attachments=list(mensaje.attachments))
+        else:
+            await mensaje.edit(view=PanelVentaView())
+    except Exception as e:
+        print(f" Error poniendo el botón de compras: {e!r}")
+        return await interaction.followup.send(
+            f"No pude ponerle el botón a ese mensaje. Error: `{type(e).__name__}: {e}`\n"
+            f"Puedes usar `/panel-ventas` sin ID para publicar un panel nuevo.", ephemeral=True)
+
+    await interaction.followup.send(f"Botón agregado: {mensaje.jump_url}", ephemeral=True)
+
+
+_INICIO_VENTAS = {"hecho": False}
+
+
+@bot.listen("on_ready")
+async def ventas_al_iniciar():
+    # Recupera los botones (tickets de compra y top) después de reiniciar el bot
+    if _INICIO_VENTAS["hecho"]:
+        return
+    _INICIO_VENTAS["hecho"] = True
+    bot.add_view(VentaLayoutView())
+    bot.add_view(PanelVentaView())
 
 
 # INICIAR BOT
