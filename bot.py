@@ -371,8 +371,12 @@ async def descender(interaction: discord.Interaction, usuario: discord.Member,
 
 
 # NOTICIAS ------------------------------------------------------------------------------------------------------------
+# NOTICIAS ------------------------------------------------------------------------------------------------------------
 # /noticia abre el formulario "Crea tu Noticia" (igual al de MXRP): título, contenido, tipo de noticia e imágenes.
 # Según el tipo, la noticia se publica en su canal y se menciona al rol de ese tipo.
+# Pueden usarlo TODOS los que tengan el rol de empleado (ROL_EMPLEADO).
+
+ROL_EMPLEADO = 1554364688098267179
 
 MAX_IMAGENES_NOTICIA = 6
 MAX_ARCHIVOS_NOTICIA = 10   # máximo de archivos por mensaje en Discord (imágenes + videos)
@@ -401,6 +405,14 @@ def es_video(archivo: discord.Attachment) -> bool:
     if archivo.content_type and archivo.content_type.startswith("video/"):
         return True
     return archivo.filename.lower().endswith((".mp4", ".mov", ".webm", ".m4v"))
+
+
+def es_empleado(interaction: discord.Interaction) -> bool:
+    # Solo funciona en servidores; si no es un Member (ej. DM) no pasa
+    miembro = interaction.user
+    if not isinstance(miembro, discord.Member):
+        return False
+    return any(r.id == ROL_EMPLEADO for r in miembro.roles)
 
 
 NOTICIAS_BORRADORES: dict = {}   # uid -> noticia pendiente (título, texto, tipo y archivos). Vive en memoria: si el bot se reinicia, se pierde.
@@ -628,10 +640,20 @@ class NoticiaModal(_ModalNoticia, title="Crea tu Noticia"):
 
 
 @bot.tree.command(name="noticia", description="Crea y publica una noticia de Grupo Televisa")
-@app_commands.checks.has_permissions(manage_roles=True)
+@app_commands.check(es_empleado)
 @app_commands.guild_only()
 async def noticia(interaction: discord.Interaction):
     await interaction.response.send_modal(NoticiaModal())
+
+
+@noticia.error
+async def noticia_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        return await interaction.response.send_message(
+            f"❌ Solo los empleados (<@&{ROL_EMPLEADO}>) pueden publicar noticias.",
+            ephemeral=True,
+        )
+    raise error
 
 
 # GENERADOR DE EMBEDS (/embed) ----------------------------------------------------------------------------------------
