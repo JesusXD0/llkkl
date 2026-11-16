@@ -710,7 +710,7 @@ def guardar_borradores():
 
 
 MAX_BLOQUES_V2 = 8
-LIMITE_TEXTO_V2 = 3900   # Discord permite 4000 caracteres de texto en total por mensaje
+LIMITE_TEXTO_V2 = 3600   # Discord permite 4000 caracteres de texto en total por mensaje
 COLORES_V2 = {
     "televisa": ("Televisa (azul)", COLOR_TELEVISA),
     "negro": ("Negro", discord.Color.from_rgb(15, 15, 15)),
@@ -759,20 +759,34 @@ def hay_contenido_v2(b: dict) -> bool:
     return bool(b["bloques"] or b["arriba"].strip() or b["abajo"].strip())
 
 
-def componentes_borrador(b: dict):
+def componentes_borrador(b: dict, previa: bool = False):
     """Arma los componentes de la tarjeta. Devuelve (componentes de nivel superior, archivos a subir)."""
     color = COLORES_V2.get(b.get("color"), COLORES_V2["televisa"])[1]
     items = []
     files = []
 
-    arriba = texto_arriba(b)
+    pie = f"-# {PIE_EMBED}"
+    # En la vista previa del editor el texto se recorta para no pasar nunca del límite de Discord
+    presupuesto = [LIMITE_TEXTO_V2 - len(pie)] if previa else [None]
+
+    def rec(t: str) -> str:
+        if presupuesto[0] is None:
+            return t
+        if len(t) <= presupuesto[0]:
+            presupuesto[0] -= len(t)
+            return t
+        t = (t[:presupuesto[0] - 1] + "…") if presupuesto[0] > 1 else ""
+        presupuesto[0] = 0
+        return t
+
+    arriba = rec(texto_arriba(b))
     if arriba:
         items.append(discord.ui.TextDisplay(arriba))
 
     contenedor = discord.ui.Container(accent_colour=color)
     for bloque in b["bloques"]:
         if bloque["t"] == "texto":
-            contenedor.add_item(discord.ui.TextDisplay(bloque.get("v") or "\u200b"))
+            contenedor.add_item(discord.ui.TextDisplay(rec(bloque.get("v") or "") or "\u200b"))
         elif bloque["t"] == "sep":
             contenedor.add_item(discord.ui.Separator())
         elif bloque["t"] == "img":
@@ -789,15 +803,14 @@ def componentes_borrador(b: dict):
 
     # El pie SIEMPRE lleva el nombre del grupo
     contenedor.add_item(discord.ui.Separator())
-    contenedor.add_item(discord.ui.TextDisplay(f"-# {PIE_EMBED}"))
+    contenedor.add_item(discord.ui.TextDisplay(pie))
     items.append(contenedor)
 
-    abajo = (b["abajo"] or "").strip()
+    abajo = rec((b["abajo"] or "").strip())
     if abajo:
         items.append(discord.ui.TextDisplay(abajo))
 
     return items, files
-
 
 def resumen_bloque(indice: int, bloque: dict) -> str:
     if bloque["t"] == "texto":
@@ -1219,14 +1232,22 @@ class CargarMensajeModal(ModalBase, title="Cargar un mensaje"):
                 "Ese mensaje no tiene contenido compatible para cargar.", ephemeral=True
             )
 
-        adjuntos = {adjunto.filename: adjunto for adjunto in mensaje.attachments}
+                adjuntos = {adjunto.filename: adjunto for adjunto in mensaje.attachments}
         bloques = []
+        restante = LIMITE_TEXTO_V2 - len(PIE_EMBED) - 10 - len(arriba) - len(abajo)
         for pieza in piezas:
             if len(bloques) >= MAX_BLOQUES_V2:
                 avisos.append(f"Solo se cargaron los primeros {MAX_BLOQUES_V2} bloques.")
                 break
             if pieza[0] == "texto":
-                bloques.append({"t": "texto", "v": pieza[1][:3000]})
+                t = pieza[1][:3000]
+                if len(t) > restante:
+                    t = t[:max(restante, 0)]
+                    avisos.append("El texto era muy largo y se recortó al límite de Discord.")
+                if not t.strip():
+                    break
+                restante -= len(t)
+                bloques.append({"t": "texto", "v": t})
             elif pieza[0] == "sep":
                 bloques.append({"t": "sep"})
             elif pieza[0] == "img":
@@ -1235,30 +1256,6 @@ class CargarMensajeModal(ModalBase, title="Cargar un mensaje"):
                     for url in pieza[1][:10]
                 ]
                 bloques.append({"t": "img", "items": items})
-
-        borrador = obtener_borrador(interaction.user.id)
-        for bloque_anterior in borrador["bloques"]:
-            borrar_archivos_bloque(bloque_anterior)
-
-        borrador["arriba"] = arriba
-        borrador["abajo"] = abajo
-        borrador["color"] = color
-        borrador["ping"] = []
-        borrador["bloques"] = bloques
-        guardar_borradores()
-
-        self.vista.stop()
-        nueva = EditorV2View(
-            self.vista.autor_id,
-            self.vista.canal,
-            None,
-            self.vista.nombre_publicacion,
-        )
-        await interaction.edit_original_response(view=nueva, attachments=nueva.files)
-        mensaje_aviso = "Mensaje cargado en tu borrador."
-        if avisos:
-            mensaje_aviso += " " + " ".join(dict.fromkeys(avisos))
-        await interaction.followup.send(mensaje_aviso, ephemeral=True)
 
 
 class TituloPublicacionModal(discord.ui.Modal, title="Nueva publicación del foro"):
@@ -1311,9 +1308,7 @@ class EditorV2View(discord.ui.LayoutView):
 
         b = self.borrador
         self.sel = seleccionado if seleccionado is not None and 0 <= seleccionado < len(b["bloques"]) else None
-
-        items, self.files = componentes_borrador(b)
-
+        items, self.files = componentes_borrador(b, previa=True)
         self.add_item(discord.ui.TextDisplay(self.encabezado()))
         self.add_item(discord.ui.Separator())
 
