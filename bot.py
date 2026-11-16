@@ -1166,127 +1166,45 @@ class CargarMensajeModal(ModalBase, title="Cargar un mensaje"):
             max_length=200,
         ),
     )
-
-    def __init__(self, vista: "EditorV2View"):
-        super().__init__()
-        self.vista = vista
-
-    async def on_submit(self, interaction: discord.Interaction):
-        texto = self.enlace.component.value.strip()
-        coincidencia = re.search(r"channels/(\d+)/(\d+)/(\d+)", texto)
-
-        if coincidencia:
-            if int(coincidencia.group(1)) != interaction.guild_id:
-                return await interaction.response.send_message(
-                    "Solo puedo cargar mensajes de este servidor.", ephemeral=True
-                )
-            canal_id = int(coincidencia.group(2))
-            mensaje_id = int(coincidencia.group(3))
-        elif texto.isdigit():
-            canal_id = interaction.channel_id
-            mensaje_id = int(texto)
-        else:
-            return await interaction.response.send_message(
-                "Pega el enlace del mensaje o su ID.", ephemeral=True
-            )
-
-        await interaction.response.defer()
-
-        canal = interaction.guild.get_channel_or_thread(canal_id)
-        if canal is None:
-            try:
-                canal = await bot.fetch_channel(canal_id)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                return await interaction.followup.send(
-                    "No encontré ese canal o no puedo acceder a él.", ephemeral=True
-                )
-
-        if not hasattr(canal, "fetch_message") or not hasattr(canal, "permissions_for"):
-            return await interaction.followup.send(
-                "Ese destino no permite leer mensajes.", ephemeral=True
-            )
-
-        permisos_usuario = canal.permissions_for(interaction.user)
-        if not (permisos_usuario.view_channel and permisos_usuario.read_message_history):
-            return await interaction.followup.send(
-                "No tienes permiso para leer el historial de ese canal.", ephemeral=True
-            )
-
-        permisos_bot = canal.permissions_for(interaction.guild.me)
-        if not (permisos_bot.view_channel and permisos_bot.read_message_history):
-            return await interaction.followup.send(
-                "Necesito los permisos **Ver canal** y **Leer historial de mensajes** "
-                "en el canal del mensaje.", ephemeral=True
-            )
-
-        try:
-            mensaje = await canal.fetch_message(mensaje_id)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            return await interaction.followup.send(
-                "No encontré ese mensaje o no tengo permiso para leerlo.", ephemeral=True
-            )
-
         arriba, abajo, piezas, color, avisos = piezas_de_mensaje(mensaje)
+
         if not (arriba or abajo or piezas):
             return await interaction.followup.send(
                 "Ese mensaje no tiene contenido compatible para cargar.", ephemeral=True
             )
 
-                adjuntos = {adjunto.filename: adjunto for adjunto in mensaje.attachments}
+        adjuntos = {adjunto.filename: adjunto for adjunto in mensaje.attachments}
+
         bloques = []
         restante = LIMITE_TEXTO_V2 - len(PIE_EMBED) - 10 - len(arriba) - len(abajo)
+
         for pieza in piezas:
             if len(bloques) >= MAX_BLOQUES_V2:
                 avisos.append(f"Solo se cargaron los primeros {MAX_BLOQUES_V2} bloques.")
                 break
+
             if pieza[0] == "texto":
                 t = pieza[1][:3000]
+
                 if len(t) > restante:
                     t = t[:max(restante, 0)]
                     avisos.append("El texto era muy largo y se recortó al límite de Discord.")
+
                 if not t.strip():
                     break
+
                 restante -= len(t)
                 bloques.append({"t": "texto", "v": t})
+
             elif pieza[0] == "sep":
                 bloques.append({"t": "sep"})
+
             elif pieza[0] == "img":
                 items = [
                     await _guardar_imagen_cargada(url, adjuntos, interaction.user.id)
                     for url in pieza[1][:10]
                 ]
                 bloques.append({"t": "img", "items": items})
-
-
-class TituloPublicacionModal(discord.ui.Modal, title="Nueva publicación del foro"):
-
-    nombre = discord.ui.TextInput(
-        label="Título de la publicación",
-        placeholder="Ej. Información importante",
-        max_length=100,
-        required=True,
-    )
-
-    def __init__(self, autor_id: int, canal):
-        super().__init__()
-        self.autor_id = autor_id
-        self.canal = canal
-
-    async def on_submit(self, interaction: discord.Interaction):
-        titulo = self.nombre.value.strip()
-
-        vista = EditorV2View(
-            self.autor_id,
-            self.canal,
-            nombre_publicacion=titulo
-        )
-
-        await interaction.response.send_message(
-            view=vista,
-            files=vista.files,
-            ephemeral=True
-        )
-
 
 # ---------- Editor ----------
 # Compatible con canales de texto y canales de foro.
