@@ -1166,6 +1166,65 @@ class CargarMensajeModal(ModalBase, title="Cargar un mensaje"):
             max_length=200,
         ),
     )
+    def __init__(self, vista: "EditorV2View"):
+        super().__init__()
+        self.vista = vista
+
+    async def on_submit(self, interaction: discord.Interaction):
+        texto = self.enlace.component.value.strip()
+        coincidencia = re.search(r"channels/(\d+)/(\d+)/(\d+)", texto)
+
+        if coincidencia:
+            if int(coincidencia.group(1)) != interaction.guild_id:
+                return await interaction.response.send_message(
+                    "Solo puedo cargar mensajes de este servidor.", ephemeral=True
+                )
+            canal_id = int(coincidencia.group(2))
+            mensaje_id = int(coincidencia.group(3))
+        elif texto.isdigit():
+            canal_id = interaction.channel_id
+            mensaje_id = int(texto)
+        else:
+            return await interaction.response.send_message(
+                "Pega el enlace del mensaje o su ID.", ephemeral=True
+            )
+
+        await interaction.response.defer()
+
+        canal = interaction.guild.get_channel_or_thread(canal_id)
+        if canal is None:
+            try:
+                canal = await bot.fetch_channel(canal_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return await interaction.followup.send(
+                    "No encontré ese canal o no puedo acceder a él.", ephemeral=True
+                )
+
+        if not hasattr(canal, "fetch_message") or not hasattr(canal, "permissions_for"):
+            return await interaction.followup.send(
+                "Ese destino no permite leer mensajes.", ephemeral=True
+            )
+
+        permisos_usuario = canal.permissions_for(interaction.user)
+        if not (permisos_usuario.view_channel and permisos_usuario.read_message_history):
+            return await interaction.followup.send(
+                "No tienes permiso para leer el historial de ese canal.", ephemeral=True
+            )
+
+        permisos_bot = canal.permissions_for(interaction.guild.me)
+        if not (permisos_bot.view_channel and permisos_bot.read_message_history):
+            return await interaction.followup.send(
+                "Necesito los permisos **Ver canal** y **Leer historial de mensajes** "
+                "en el canal del mensaje.", ephemeral=True
+            )
+
+        try:
+            mensaje = await canal.fetch_message(mensaje_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return await interaction.followup.send(
+                "No encontré ese mensaje o no tengo permiso para leerlo.", ephemeral=True
+            )
+
         arriba, abajo, piezas, color, avisos = piezas_de_mensaje(mensaje)
 
         if not (arriba or abajo or piezas):
